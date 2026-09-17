@@ -12,5 +12,6 @@ cmake --build build -j$(nproc)
 
 if [[ "$1" == "-R" ]]; then
     echo "-- Running SoundMapper"
-    ./build/SoundMapper
+    cd /home/$USER/soundmapper/build/bin
+    ./soundmapper
 fi

@@ -1,0 +1,9 @@
+add_example_executable(soundmapper
+    soundmapper.cpp
+    utilities/builders.h
+    utilities/drawing.h
+    utilities/widgets.h
+    utilities/builders.cpp
+    utilities/drawing.cpp
+    utilities/widgets.cpp
+)
