@@ -207,14 +207,44 @@ struct Example:
         }
     }
 
-    Node* SpawnInputActionNode()
+    Node* SpawnSinkInputNode()
     {
-        m_Nodes.emplace_back(GetNextId(), "InputAction Fire", ImColor(255, 128, 128));
-        m_Nodes.back().Outputs.emplace_back(GetNextId(), "Pressed", PinType::Flow);
-        m_Nodes.back().Outputs.emplace_back(GetNextId(), "Released", PinType::Flow);
-
+        m_Nodes.emplace_back(GetNextId(), "Sink-Input", ImColor(255, 128, 128));
+        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Flow);
         BuildNode(&m_Nodes.back());
+        return &m_Nodes.back();
+    }
 
+    Node* SpawnSourceOutputNode()
+    {
+        m_Nodes.emplace_back(GetNextId(), "Source-Output", ImColor(128, 255, 128));
+        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Flow);
+        BuildNode(&m_Nodes.back());
+        return &m_Nodes.back();
+    }
+
+    Node* SpawnSinkNode()
+    {
+        m_Nodes.emplace_back(GetNextId(), "Sink", ImColor(128, 128, 255));
+        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Flow);
+        BuildNode(&m_Nodes.back());
+        return &m_Nodes.back();
+    }
+
+    Node* SpawnSourceNode()
+    {
+        m_Nodes.emplace_back(GetNextId(), "Source", ImColor(255, 255, 128));
+        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Flow);
+        BuildNode(&m_Nodes.back());
+        return &m_Nodes.back();
+    }
+
+    Node* SpawnLoopbackNode()
+    {
+        m_Nodes.emplace_back(GetNextId(), "Loopback", ImColor(255, 128, 255));
+        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Flow);
+        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Flow);
+        BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
 
@@ -264,7 +294,11 @@ struct Example:
         ed::SetCurrentEditor(m_Editor);
 
         Node* node;
-        node = SpawnInputActionNode();      ed::SetNodePosition(node->ID, ImVec2(-252, 220));
+        node = SpawnSinkInputNode();      ed::SetNodePosition(node->ID, ImVec2(-252, 100));
+        node = SpawnSourceOutputNode();   ed::SetNodePosition(node->ID, ImVec2(-252, 200));
+        node = SpawnSinkNode();           ed::SetNodePosition(node->ID, ImVec2(-252, 300));
+        node = SpawnSourceNode();         ed::SetNodePosition(node->ID, ImVec2(-252, 400));
+        node = SpawnLoopbackNode();       ed::SetNodePosition(node->ID, ImVec2(-252, 500));
 
         ed::NavigateToContent();
 
@@ -592,8 +626,16 @@ struct Example:
             auto newNodePostion = openPopupPosition;
 
             Node* node = nullptr;
-            if (ImGui::MenuItem("Input Action"))
-                node = SpawnInputActionNode();
+            if (ImGui::MenuItem("Sink-Input"))
+                node = SpawnSinkInputNode();
+            if (ImGui::MenuItem("Source-Output"))
+                node = SpawnSourceOutputNode();
+            if (ImGui::MenuItem("Sink"))
+                node = SpawnSinkNode();
+            if (ImGui::MenuItem("Source"))
+                node = SpawnSourceNode();
+            if (ImGui::MenuItem("Loopback"))
+                node = SpawnLoopbackNode();
 
             if (node)
             {
