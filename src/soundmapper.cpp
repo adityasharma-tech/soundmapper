@@ -69,9 +69,10 @@ struct Node
 
     std::string State;
     std::string SavedState;
+    int DemoOption;
 
     Node(int id, const char* name, ImColor color = ImColor(255, 255, 255)):
-        ID(id), Name(name), Color(color), Type(NodeType::Blueprint), Size(0, 0)
+        ID(id), Name(name), Color(color), Type(NodeType::Blueprint), Size(0, 0), DemoOption(0)
     {
     }
 };
@@ -90,6 +91,18 @@ struct Link
     {
     }
 };
+
+static bool Splitter(bool split_vertically, float thickness, float* size1, float* size2, float min_size1, float min_size2, float splitter_long_axis_size = -1.0f)
+{
+    using namespace ImGui;
+    ImGuiContext& g = *GImGui;
+    ImGuiWindow* window = g.CurrentWindow;
+    ImGuiID id = window->GetID("##Splitter");
+    ImRect bb;
+    bb.Min = window->DC.CursorPos + (split_vertically ? ImVec2(*size1, 0.0f) : ImVec2(0.0f, *size1));
+    bb.Max = bb.Min + CalcItemSize(split_vertically ? ImVec2(thickness, splitter_long_axis_size) : ImVec2(splitter_long_axis_size, thickness), 0.0f, 0.0f);
+    return SplitterBehavior(bb, id, split_vertically ? ImGuiAxis_X : ImGuiAxis_Y, size1, size2, min_size1, min_size2, 0.0f);
+}
 
 struct NodeIdLess
 {
@@ -359,6 +372,52 @@ struct Example:
         ax::Widgets::Icon(ImVec2(static_cast<float>(m_PinIconSize), static_cast<float>(m_PinIconSize)), IconType::Flow, connected, color, ImColor(32, 32, 32, alpha));
     };
 
+    void ShowLeftPane(float paneWidth)
+    {
+        auto& io = ImGui::GetIO();
+        ImGui::BeginChild("Selection", ImVec2(paneWidth, 0));
+        paneWidth = ImGui::GetContentRegionAvail().x;
+
+        ImGui::TextUnformatted("Node Details");
+        ImGui::Separator();
+
+        std::vector<ed::NodeId> selectedNodes;
+        selectedNodes.resize(ed::GetSelectedObjectCount());
+        int nodeCount = ed::GetSelectedNodes(selectedNodes.data(), static_cast<int>(selectedNodes.size()));
+        selectedNodes.resize(nodeCount);
+
+        if (nodeCount > 0)
+        {
+            auto node = FindNode(selectedNodes[0]);
+            if (node)
+            {
+                ImGui::Text("Name: %s", node->Name.c_str());
+                ImGui::Text("ID: %p", node->ID.AsPointer());
+                ImGui::Text("Type: Blueprint");
+                ImGui::Text("Inputs: %d", (int)node->Inputs.size());
+                ImGui::Text("Outputs: %d", (int)node->Outputs.size());
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("Node Options:");
+                const char* options[] = { "Option 1 (Default)", "Option 2 (Advanced)", "Option 3 (Experimental)" };
+                ImGui::SetNextItemWidth(paneWidth - 20);
+                ImGui::Combo("##demo_combo", &node->DemoOption, options, IM_ARRAYSIZE(options));
+                
+                ImGui::Spacing();
+                ImGui::TextWrapped("You selected %s for node %s.", options[node->DemoOption], node->Name.c_str());
+            }
+        }
+        else
+        {
+            ImGui::Text("No node selected.");
+        }
+
+        ImGui::EndChild();
+    }
+
     void OnFrame(float deltaTime) override
     {
         UpdateTouch();
@@ -371,6 +430,14 @@ struct Example:
         static bool createNewNode  = false;
         static Pin* newNodeLinkPin = nullptr;
         static Pin* newLinkPin     = nullptr;
+
+        static float leftPaneWidth  = 400.0f;
+        static float rightPaneWidth = 800.0f;
+        Splitter(true, 4.0f, &leftPaneWidth, &rightPaneWidth, 50.0f, 50.0f);
+
+        ShowLeftPane(leftPaneWidth - 4.0f);
+
+        ImGui::SameLine(0.0f, 12.0f);
 
         ed::Begin("Node editor");
         {
