@@ -24,7 +24,10 @@ static ed::EditorContext* m_Editor = nullptr;
 
 enum class PinType
 {
-    Flow,
+    SinkInput,
+    SourceOutput,
+    Sink,
+    Source
 };
 
 enum class PinKind
@@ -186,7 +189,16 @@ struct Example:
 
     bool CanCreateLink(Pin* a, Pin* b)
     {
-        if (!a || !b || a == b || a->Kind == b->Kind || a->Type != b->Type || a->Node == b->Node)
+        if (!a || !b || a == b || a->Kind == b->Kind || a->Node == b->Node)
+            return false;
+
+        bool validSink = (a->Type == PinType::SinkInput && b->Type == PinType::Sink) ||
+                         (b->Type == PinType::SinkInput && a->Type == PinType::Sink);
+        
+        bool validSource = (a->Type == PinType::SourceOutput && b->Type == PinType::Source) ||
+                           (b->Type == PinType::SourceOutput && a->Type == PinType::Source);
+
+        if (!validSink && !validSource)
             return false;
 
         return true;
@@ -210,7 +222,7 @@ struct Example:
     Node* SpawnSinkInputNode()
     {
         m_Nodes.emplace_back(GetNextId(), "Sink-Input", ImColor(255, 128, 128));
-        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Flow);
+        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::SinkInput);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
@@ -218,7 +230,7 @@ struct Example:
     Node* SpawnSourceOutputNode()
     {
         m_Nodes.emplace_back(GetNextId(), "Source-Output", ImColor(128, 255, 128));
-        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Flow);
+        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::SourceOutput);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
@@ -226,7 +238,7 @@ struct Example:
     Node* SpawnSinkNode()
     {
         m_Nodes.emplace_back(GetNextId(), "Sink", ImColor(128, 128, 255));
-        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Flow);
+        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Sink);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
@@ -234,7 +246,7 @@ struct Example:
     Node* SpawnSourceNode()
     {
         m_Nodes.emplace_back(GetNextId(), "Source", ImColor(255, 255, 128));
-        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Flow);
+        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Source);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
@@ -242,8 +254,8 @@ struct Example:
     Node* SpawnLoopbackNode()
     {
         m_Nodes.emplace_back(GetNextId(), "Loopback", ImColor(255, 128, 255));
-        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Flow);
-        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Flow);
+        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Sink);
+        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Source);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
@@ -331,8 +343,11 @@ struct Example:
     {
         switch (type)
         {
-            default:
-            case PinType::Flow:     return ImColor(255, 255, 255);
+            case PinType::SinkInput:    return ImColor(255, 128, 128);
+            case PinType::SourceOutput: return ImColor(128, 255, 128);
+            case PinType::Sink:         return ImColor(128, 128, 255);
+            case PinType::Source:       return ImColor(255, 255, 128);
+            default:                    return ImColor(255, 255, 255);
         }
     };
 
@@ -473,7 +488,7 @@ struct Example:
                                showLabel("x Cannot connect to self", ImColor(45, 32, 32, 180));
                                ed::RejectNewItem(ImColor(255, 0, 0), 1.0f);
                             }
-                            else if (endPin->Type != startPin->Type)
+                            else if (!CanCreateLink(startPin, endPin))
                             {
                                 showLabel("x Incompatible Pin Type", ImColor(45, 32, 32, 180));
                                 ed::RejectNewItem(ImColor(255, 128, 128), 1.0f);
