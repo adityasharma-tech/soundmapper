@@ -91,6 +91,7 @@ struct Node
     std::string SavedState;
     int DemoOption;
     uint32_t PA_ID;
+    std::string PA_Name;
 
     Node(int id, const char* name, uint32_t pa_id = 0, ImColor color = ImColor(255, 255, 255)):
         ID(id), Name(name), Color(color), Type(NodeType::Blueprint), Size(0, 0), DemoOption(0), PA_ID(pa_id)
@@ -106,9 +107,10 @@ struct Link
     ed::PinId EndPinID;
 
     ImColor Color;
+    uint32_t PA_Module_ID;
 
     Link(ed::LinkId id, ed::PinId startPinId, ed::PinId endPinId):
-        ID(id), StartPinID(startPinId), EndPinID(endPinId), Color(255, 255, 255)
+        ID(id), StartPinID(startPinId), EndPinID(endPinId), Color(255, 255, 255), PA_Module_ID(0)
     {
     }
 };
@@ -141,6 +143,7 @@ struct Example:
     struct PAEntity {
         uint32_t ID;
         std::string Name;
+        std::string PA_Name;
     };
     std::vector<PAEntity> m_AvailableSinks;
     std::vector<PAEntity> m_AvailableSources;
@@ -242,7 +245,10 @@ struct Example:
         bool validSource = (a->Type == PinType::SourceOutput && b->Type == PinType::Source) ||
                            (b->Type == PinType::SourceOutput && a->Type == PinType::Source);
 
-        if (!validSink && !validSource)
+        bool validLoopback = (a->Type == PinType::Source && b->Type == PinType::Sink) ||
+                             (b->Type == PinType::Source && a->Type == PinType::Sink);
+
+        if (!validSink && !validSource && !validLoopback)
             return false;
 
         return true;
@@ -309,6 +315,7 @@ struct Example:
     void RefreshGraph()
     {
         m_Nodes.clear();
+        m_Nodes.reserve(1000); // Prevent reallocation invalidating Node* pointers
         m_Links.clear();
         m_AvailableSinks.clear();
         m_AvailableSources.clear();
@@ -332,9 +339,11 @@ struct Example:
             float y = 0;
             for (auto& s : sinks) {
                 uint32_t id = s.value("index", 0);
-                std::string name = s.value("description", s.value("name", "Unknown Sink"));
-                m_AvailableSinks.push_back({id, name});
-                Node* n = SpawnSinkNode(id, name.c_str());
+                std::string desc = s.value("description", s.value("name", "Unknown Sink"));
+                std::string pa_name = s.value("name", "");
+                m_AvailableSinks.push_back({id, desc, pa_name});
+                Node* n = SpawnSinkNode(id, desc.c_str());
+                n->PA_Name = pa_name;
                 ed::SetNodePosition(n->ID, ImVec2(500, y));
                 sink_nodes[id] = n;
                 y += 150;
@@ -343,9 +352,11 @@ struct Example:
             y = 0;
             for (auto& s : sources) {
                 uint32_t id = s.value("index", 0);
-                std::string name = s.value("description", s.value("name", "Unknown Source"));
-                m_AvailableSources.push_back({id, name});
-                Node* n = SpawnSourceNode(id, name.c_str());
+                std::string desc = s.value("description", s.value("name", "Unknown Source"));
+                std::string pa_name = s.value("name", "");
+                m_AvailableSources.push_back({id, desc, pa_name});
+                Node* n = SpawnSourceNode(id, desc.c_str());
+                n->PA_Name = pa_name;
                 ed::SetNodePosition(n->ID, ImVec2(-500, y));
                 source_nodes[id] = n;
                 y += 150;
@@ -388,6 +399,29 @@ struct Example:
                     m_Links.back().Color = GetIconColor(PinType::Source);
                 }
             }
+
+            // Auto-link monitor sources to their parent sinks
+            for (auto& s : sources) {
+                if (s.contains("monitor_source") || s.value("name", "").find(".monitor") != std::string::npos) {
+                    // Find if this source monitors a sink
+                    uint32_t source_id = s.value("index", 0);
+                    std::string source_pa_name = s.value("name", "");
+                    
+                    // Check monitor_of_sink field if available, otherwise match by name
+                    for (auto& sk : sinks) {
+                        std::string sink_monitor = sk.value("monitor_source", "");
+                        if (!sink_monitor.empty() && sink_monitor == source_pa_name) {
+                            uint32_t sink_id = sk.value("index", 0);
+                            if (source_nodes.count(source_id) && sink_nodes.count(sink_id)) {
+                                m_Links.emplace_back(Link(GetNextId(), source_nodes[source_id]->Outputs[0].ID, sink_nodes[sink_id]->Inputs[0].ID));
+                                m_Links.back().Color = GetIconColor(PinType::Source);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
         } catch (...) {
             printf("Failed to parse PulseAudio JSON\n");
         }
@@ -729,12 +763,13 @@ struct Example:
                                 showLabel("+ Create Link", ImColor(32, 45, 32, 180));
                                 if (ed::AcceptNewItem(ImColor(128, 255, 128), 4.0f))
                                 {
-                                    if (startPin->Type == PinType::SourceOutput || startPin->Node->Name == "Loopback" || startPin->Type == PinType::SinkInput)
+                                    // Enforce single-link on pins that need it
+                                    if (startPin->Type == PinType::SourceOutput || startPin->Type == PinType::SinkInput)
                                     {
                                         m_Links.erase(std::remove_if(m_Links.begin(), m_Links.end(),
                                             [startPinId](const Link& l) { return l.StartPinID == startPinId || l.EndPinID == startPinId; }), m_Links.end());
                                     }
-                                    if (endPin->Type == PinType::SourceOutput || endPin->Node->Name == "Loopback" || endPin->Type == PinType::SinkInput)
+                                    if (endPin->Type == PinType::SourceOutput || endPin->Type == PinType::SinkInput)
                                     {
                                         m_Links.erase(std::remove_if(m_Links.begin(), m_Links.end(),
                                             [endPinId](const Link& l) { return l.StartPinID == endPinId || l.EndPinID == endPinId; }), m_Links.end());
@@ -743,7 +778,7 @@ struct Example:
                                     m_Links.emplace_back(Link(GetNextId(), startPinId, endPinId));
                                     m_Links.back().Color = GetIconColor(startPin->Type);
 
-                                    // Run pactl command
+                                    // Run pactl command for sink-input -> sink
                                     if (startPin->Type == PinType::SinkInput || endPin->Type == PinType::SinkInput) {
                                         Pin* sinkInputPin = startPin->Type == PinType::SinkInput ? startPin : endPin;
                                         Pin* sinkPin = startPin->Type == PinType::Sink ? startPin : endPin;
@@ -754,6 +789,7 @@ struct Example:
                                         }
                                     }
                                     
+                                    // Run pactl command for source-output -> source
                                     if (startPin->Type == PinType::SourceOutput || endPin->Type == PinType::SourceOutput) {
                                         Pin* sourceOutputPin = startPin->Type == PinType::SourceOutput ? startPin : endPin;
                                         Pin* sourcePin = startPin->Type == PinType::Source ? startPin : endPin;
@@ -761,6 +797,22 @@ struct Example:
                                             char cmd[256];
                                             snprintf(cmd, sizeof(cmd), "pactl move-source-output %u %u", sourceOutputPin->Node->PA_ID, sourcePin->Node->PA_ID);
                                             ExecCommand(cmd);
+                                        }
+                                    }
+
+                                    // Run pactl command for source -> sink (loopback module)
+                                    if ((startPin->Type == PinType::Source && endPin->Type == PinType::Sink) ||
+                                        (startPin->Type == PinType::Sink && endPin->Type == PinType::Source)) {
+                                        Pin* sourcePin = startPin->Type == PinType::Source ? startPin : endPin;
+                                        Pin* sinkPin = startPin->Type == PinType::Sink ? startPin : endPin;
+                                        if (sourcePin && sinkPin) {
+                                            char cmd[512];
+                                            snprintf(cmd, sizeof(cmd), "pactl load-module module-loopback source=%s sink=%s",
+                                                sourcePin->Node->PA_Name.c_str(), sinkPin->Node->PA_Name.c_str());
+                                            std::string output = ExecCommand(cmd);
+                                            try {
+                                                m_Links.back().PA_Module_ID = std::stoul(output);
+                                            } catch (...) {}
                                         }
                                     }
                                 }
@@ -811,7 +863,15 @@ struct Example:
                         {
                             auto id = std::find_if(m_Links.begin(), m_Links.end(), [linkId](auto& link) { return link.ID == linkId; });
                             if (id != m_Links.end())
+                            {
+                                if (id->PA_Module_ID > 0)
+                                {
+                                    char cmd[256];
+                                    snprintf(cmd, sizeof(cmd), "pactl unload-module %u", id->PA_Module_ID);
+                                    ExecCommand(cmd);
+                                }
                                 m_Links.erase(id);
+                            }
                         }
                     }
                 }
