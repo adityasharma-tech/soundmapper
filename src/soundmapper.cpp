@@ -92,6 +92,7 @@ struct Node
     int DemoOption;
     uint32_t PA_ID;
     std::string PA_Name;
+    std::string Details;
 
     Node(int id, const char* name, uint32_t pa_id = 0, ImColor color = ImColor(255, 255, 255)):
         ID(id), Name(name), Color(color), Type(NodeType::Blueprint), Size(0, 0), DemoOption(0), PA_ID(pa_id)
@@ -312,6 +313,43 @@ struct Example:
 
 
     
+    
+    std::string ParseDetails(const json& item) {
+        std::string details;
+        auto add_str = [&](const char* key, const char* label) {
+            if (item.contains(key)) {
+                if (item[key].is_string()) details += std::string(label) + ": " + item[key].get<std::string>() + "\n";
+                else if (item[key].is_number_integer()) details += std::string(label) + ": " + std::to_string(item[key].get<int>()) + "\n";
+                else if (item[key].is_number_unsigned()) details += std::string(label) + ": " + std::to_string(item[key].get<unsigned int>()) + "\n";
+                else if (item[key].is_number_float()) details += std::string(label) + ": " + std::to_string(item[key].get<double>()) + "\n";
+                else if (item[key].is_boolean()) details += std::string(label) + ": " + (item[key].get<bool>() ? "yes" : "no") + "\n";
+            }
+        };
+        add_str("driver", "Driver");
+        add_str("state", "State");
+        add_str("corked", "Corked");
+        add_str("mute", "Mute");
+        add_str("sample_specification", "Sample Spec");
+        add_str("channel_map", "Channel Map");
+        add_str("sink", "Sink ID");
+        add_str("source", "Source ID");
+        add_str("owner_module", "Owner Module");
+        add_str("client", "Client ID");
+        add_str("buffer_latency_usec", "Buffer Latency (us)");
+        add_str("sink_latency_usec", "Sink Latency (us)");
+        add_str("resample_method", "Resample Method");
+        
+        if (item.contains("volume") && item["volume"].is_object()) {
+            details += "Volume:\n";
+            for (auto iter = item["volume"].begin(); iter != item["volume"].end(); ++iter) {
+                if (iter.value().is_object() && iter.value().contains("value_percent")) {
+                    details += "  " + iter.key() + ": " + iter.value()["value_percent"].get<std::string>() + "\n";
+                }
+            }
+        }
+        return details;
+    }
+
     void RefreshGraph()
     {
         m_Nodes.clear();
@@ -344,6 +382,7 @@ struct Example:
                 m_AvailableSinks.push_back({id, desc, pa_name});
                 Node* n = SpawnSinkNode(id, desc.c_str());
                 n->PA_Name = pa_name;
+                n->Details = ParseDetails(s);
                 ed::SetNodePosition(n->ID, ImVec2(500, y));
                 sink_nodes[id] = n;
                 y += 150;
@@ -357,6 +396,7 @@ struct Example:
                 m_AvailableSources.push_back({id, desc, pa_name});
                 Node* n = SpawnSourceNode(id, desc.c_str());
                 n->PA_Name = pa_name;
+                n->Details = ParseDetails(s);
                 ed::SetNodePosition(n->ID, ImVec2(-500, y));
                 source_nodes[id] = n;
                 y += 150;
@@ -366,11 +406,19 @@ struct Example:
             for (auto& si : sink_inputs) {
                 uint32_t id = si.value("index", 0);
                 std::string name = si.value("name", "Unknown Sink-Input");
-                if (si.contains("properties") && si["properties"].contains("application.name")) {
-                    name = si["properties"]["application.name"];
+                if (si.contains("properties")) {
+                    if (si["properties"].contains("application.name")) {
+                        name = si["properties"]["application.name"];
+                    }
+                    if (si["properties"].contains("media.name")) {
+                        std::string media = si["properties"]["media.name"];
+                        if (media.length() > 25) media = media.substr(0, 22) + "...";
+                        name += " - " + media;
+                    }
                 }
-                m_AvailableSinkInputs.push_back({id, name});
+                m_AvailableSinkInputs.push_back({id, name, ""});
                 Node* n = SpawnSinkInputNode(id, name.c_str());
+                n->Details = ParseDetails(si);
                 ed::SetNodePosition(n->ID, ImVec2(0, y));
                 y += 150;
 
@@ -385,11 +433,19 @@ struct Example:
             for (auto& so : source_outputs) {
                 uint32_t id = so.value("index", 0);
                 std::string name = so.value("name", "Unknown Source-Output");
-                if (so.contains("properties") && so["properties"].contains("application.name")) {
-                    name = so["properties"]["application.name"];
+                if (so.contains("properties")) {
+                    if (so["properties"].contains("application.name")) {
+                        name = so["properties"]["application.name"];
+                    }
+                    if (so["properties"].contains("media.name")) {
+                        std::string media = so["properties"]["media.name"];
+                        if (media.length() > 25) media = media.substr(0, 22) + "...";
+                        name += " - " + media;
+                    }
                 }
-                m_AvailableSourceOutputs.push_back({id, name});
+                m_AvailableSourceOutputs.push_back({id, name, ""});
                 Node* n = SpawnSourceOutputNode(id, name.c_str());
+                n->Details = ParseDetails(so);
                 ed::SetNodePosition(n->ID, ImVec2(-250, y));
                 y += 150;
 
@@ -522,7 +578,10 @@ struct Example:
     void ShowLeftPane(float paneWidth)
     {
         auto& io = ImGui::GetIO();
-        ImGui::BeginChild("Selection", ImVec2(paneWidth, 0));
+        
+        ImGui::BeginChild("LeftPane", ImVec2(paneWidth, 0));
+        
+        ImGui::BeginChild("Selection", ImVec2(paneWidth, -150.0f));
         paneWidth = ImGui::GetContentRegionAvail().x;
 
         ImGui::TextUnformatted("Node Details");
@@ -594,6 +653,9 @@ struct Example:
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
+                
+                ImGui::Text("Properties:");
+                ImGui::TextWrapped("%s", node->Details.c_str());
 
             }
         }
@@ -602,13 +664,23 @@ struct Example:
             ImGui::Text("No node selected.");
         }
 
+        ImGui::EndChild();
         
+        ImGui::Separator();
         ImGui::Spacing();
+        ImGui::Text("Global Actions:");
         if (ImGui::Button("Refresh Graph", ImVec2(paneWidth - 20, 30))) {
             m_WantsRefresh = true;
         }
+        if (ImGui::Button("Create Loopback Module", ImVec2(paneWidth - 20, 30))) {
+            ExecCommand("pactl load-module module-loopback");
+            m_WantsRefresh = true;
+        }
+        if (ImGui::Button("Create Null Sink", ImVec2(paneWidth - 20, 30))) {
+            ExecCommand("pactl load-module module-null-sink");
+            m_WantsRefresh = true;
+        }
         ImGui::EndChild();
-
     }
 
     void OnFrame(float deltaTime) override
