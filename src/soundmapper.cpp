@@ -498,6 +498,17 @@ struct Example:
                                 showLabel("+ Create Link", ImColor(32, 45, 32, 180));
                                 if (ed::AcceptNewItem(ImColor(128, 255, 128), 4.0f))
                                 {
+                                    if (startPin->Type == PinType::SourceOutput)
+                                    {
+                                        m_Links.erase(std::remove_if(m_Links.begin(), m_Links.end(),
+                                            [startPinId](const Link& l) { return l.StartPinID == startPinId || l.EndPinID == startPinId; }), m_Links.end());
+                                    }
+                                    if (endPin->Type == PinType::SourceOutput)
+                                    {
+                                        m_Links.erase(std::remove_if(m_Links.begin(), m_Links.end(),
+                                            [endPinId](const Link& l) { return l.StartPinID == endPinId || l.EndPinID == endPinId; }), m_Links.end());
+                                    }
+
                                     m_Links.emplace_back(Link(GetNextId(), startPinId, endPinId));
                                     m_Links.back().Color = GetIconColor(startPin->Type);
                                 }
