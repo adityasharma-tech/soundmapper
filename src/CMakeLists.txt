@@ -7,3 +7,4 @@ add_example_executable(soundmapper
     utilities/drawing.cpp
     utilities/widgets.cpp
 )
+target_include_directories(soundmapper PRIVATE ${CMAKE_SOURCE_DIR}/thirdparty)

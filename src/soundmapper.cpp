@@ -4,9 +4,29 @@
 #include "utilities/widgets.h"
 
 #include <imgui_node_editor.h>
-#include <imgui_internal.h>
 
+#include <imgui_internal.h>
+#include <nlohmann/json.hpp>
+#include <cstdio>
+#include <memory>
+#include <array>
 #include <string>
+
+using json = nlohmann::json;
+
+std::string ExecCommand(const char* cmd) {
+    std::array<char, 128> buffer;
+    std::string result;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+    if (!pipe) {
+        return "";
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+    return result;
+}
+
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -70,9 +90,10 @@ struct Node
     std::string State;
     std::string SavedState;
     int DemoOption;
+    uint32_t PA_ID;
 
-    Node(int id, const char* name, ImColor color = ImColor(255, 255, 255)):
-        ID(id), Name(name), Color(color), Type(NodeType::Blueprint), Size(0, 0), DemoOption(0)
+    Node(int id, const char* name, uint32_t pa_id = 0, ImColor color = ImColor(255, 255, 255)):
+        ID(id), Name(name), Color(color), Type(NodeType::Blueprint), Size(0, 0), DemoOption(0), PA_ID(pa_id)
     {
     }
 };
@@ -116,6 +137,16 @@ struct Example:
     public Application
 {
     using Application::Application;
+
+    struct PAEntity {
+        uint32_t ID;
+        std::string Name;
+    };
+    std::vector<PAEntity> m_AvailableSinks;
+    std::vector<PAEntity> m_AvailableSources;
+    std::vector<PAEntity> m_AvailableSinkInputs;
+    std::vector<PAEntity> m_AvailableSourceOutputs;
+    bool m_WantsRefresh = true;
 
     int GetNextId()
     {
@@ -232,45 +263,136 @@ struct Example:
         }
     }
 
-    Node* SpawnSinkInputNode()
+    Node* SpawnSinkInputNode(uint32_t pa_id = 0, const char* name = "Sink-Input")
     {
-        m_Nodes.emplace_back(GetNextId(), "Sink-Input", ImColor(255, 128, 128));
+        m_Nodes.emplace_back(GetNextId(), name, pa_id, ImColor(255, 128, 128));
         m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::SinkInput);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
 
-    Node* SpawnSourceOutputNode()
+    Node* SpawnSourceOutputNode(uint32_t pa_id = 0, const char* name = "Source-Output")
     {
-        m_Nodes.emplace_back(GetNextId(), "Source-Output", ImColor(128, 255, 128));
+        m_Nodes.emplace_back(GetNextId(), name, pa_id, ImColor(128, 255, 128));
         m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::SourceOutput);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
 
-    Node* SpawnSinkNode()
+    Node* SpawnSinkNode(uint32_t pa_id = 0, const char* name = "Sink")
     {
-        m_Nodes.emplace_back(GetNextId(), "Sink", ImColor(128, 128, 255));
+        m_Nodes.emplace_back(GetNextId(), name, pa_id, ImColor(128, 128, 255));
         m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Sink);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
 
-    Node* SpawnSourceNode()
+    Node* SpawnSourceNode(uint32_t pa_id = 0, const char* name = "Source")
     {
-        m_Nodes.emplace_back(GetNextId(), "Source", ImColor(255, 255, 128));
+        m_Nodes.emplace_back(GetNextId(), name, pa_id, ImColor(255, 255, 128));
         m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Source);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
 
-    Node* SpawnLoopbackNode()
+    Node* SpawnLoopbackNode(uint32_t pa_id = 0, const char* name = "Loopback")
     {
-        m_Nodes.emplace_back(GetNextId(), "Loopback", ImColor(255, 128, 255));
+        m_Nodes.emplace_back(GetNextId(), name, pa_id, ImColor(255, 128, 255));
         m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Sink);
         m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Source);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
+    }
+
+
+    
+    void RefreshGraph()
+    {
+        m_Nodes.clear();
+        m_Links.clear();
+        m_AvailableSinks.clear();
+        m_AvailableSources.clear();
+        m_AvailableSinkInputs.clear();
+        m_AvailableSourceOutputs.clear();
+        
+        std::string sinks_json = ExecCommand("pactl -f json list sinks");
+        std::string sources_json = ExecCommand("pactl -f json list sources");
+        std::string sink_inputs_json = ExecCommand("pactl -f json list sink-inputs");
+        std::string source_outputs_json = ExecCommand("pactl -f json list source-outputs");
+
+        try {
+            auto sinks = json::parse(sinks_json);
+            auto sources = json::parse(sources_json);
+            auto sink_inputs = json::parse(sink_inputs_json);
+            auto source_outputs = json::parse(source_outputs_json);
+
+            std::map<uint32_t, Node*> sink_nodes;
+            std::map<uint32_t, Node*> source_nodes;
+
+            float y = 0;
+            for (auto& s : sinks) {
+                uint32_t id = s.value("index", 0);
+                std::string name = s.value("description", s.value("name", "Unknown Sink"));
+                m_AvailableSinks.push_back({id, name});
+                Node* n = SpawnSinkNode(id, name.c_str());
+                ed::SetNodePosition(n->ID, ImVec2(500, y));
+                sink_nodes[id] = n;
+                y += 150;
+            }
+
+            y = 0;
+            for (auto& s : sources) {
+                uint32_t id = s.value("index", 0);
+                std::string name = s.value("description", s.value("name", "Unknown Source"));
+                m_AvailableSources.push_back({id, name});
+                Node* n = SpawnSourceNode(id, name.c_str());
+                ed::SetNodePosition(n->ID, ImVec2(-500, y));
+                source_nodes[id] = n;
+                y += 150;
+            }
+
+            y = 0;
+            for (auto& si : sink_inputs) {
+                uint32_t id = si.value("index", 0);
+                std::string name = si.value("name", "Unknown Sink-Input");
+                if (si.contains("properties") && si["properties"].contains("application.name")) {
+                    name = si["properties"]["application.name"];
+                }
+                m_AvailableSinkInputs.push_back({id, name});
+                Node* n = SpawnSinkInputNode(id, name.c_str());
+                ed::SetNodePosition(n->ID, ImVec2(0, y));
+                y += 150;
+
+                uint32_t target_sink = si.value("sink", (uint32_t)-1);
+                if (target_sink != (uint32_t)-1 && sink_nodes.count(target_sink)) {
+                    m_Links.emplace_back(Link(GetNextId(), n->Outputs[0].ID, sink_nodes[target_sink]->Inputs[0].ID));
+                    m_Links.back().Color = GetIconColor(PinType::SinkInput);
+                }
+            }
+
+            y = 0;
+            for (auto& so : source_outputs) {
+                uint32_t id = so.value("index", 0);
+                std::string name = so.value("name", "Unknown Source-Output");
+                if (so.contains("properties") && so["properties"].contains("application.name")) {
+                    name = so["properties"]["application.name"];
+                }
+                m_AvailableSourceOutputs.push_back({id, name});
+                Node* n = SpawnSourceOutputNode(id, name.c_str());
+                ed::SetNodePosition(n->ID, ImVec2(-250, y));
+                y += 150;
+
+                uint32_t target_source = so.value("source", (uint32_t)-1);
+                if (target_source != (uint32_t)-1 && source_nodes.count(target_source)) {
+                    m_Links.emplace_back(Link(GetNextId(), source_nodes[target_source]->Outputs[0].ID, n->Inputs[0].ID));
+                    m_Links.back().Color = GetIconColor(PinType::Source);
+                }
+            }
+        } catch (...) {
+            printf("Failed to parse PulseAudio JSON\n");
+        }
+
+        BuildNodes();
     }
 
     void BuildNodes()
@@ -318,16 +440,7 @@ struct Example:
         m_Editor = ed::CreateEditor(&config);
         ed::SetCurrentEditor(m_Editor);
 
-        Node* node;
-        node = SpawnSinkInputNode();      ed::SetNodePosition(node->ID, ImVec2(-252, 100));
-        node = SpawnSourceOutputNode();   ed::SetNodePosition(node->ID, ImVec2(-252, 200));
-        node = SpawnSinkNode();           ed::SetNodePosition(node->ID, ImVec2(-252, 300));
-        node = SpawnSourceNode();         ed::SetNodePosition(node->ID, ImVec2(-252, 400));
-        node = SpawnLoopbackNode();       ed::SetNodePosition(node->ID, ImVec2(-252, 500));
-
-        ed::NavigateToContent();
-
-        BuildNodes();
+        m_WantsRefresh = true;
 
         m_HeaderBackground = LoadTexture("data/BlueprintBackground.png");
     }
@@ -401,13 +514,53 @@ struct Example:
                 ImGui::Separator();
                 ImGui::Spacing();
 
-                ImGui::Text("Node Options:");
-                const char* options[] = { "Option 1 (Default)", "Option 2 (Advanced)", "Option 3 (Experimental)" };
-                ImGui::SetNextItemWidth(paneWidth - 20);
-                ImGui::Combo("##demo_combo", &node->DemoOption, options, IM_ARRAYSIZE(options));
+                ImGui::Text("PulseAudio Target Entity:");
+                std::vector<PAEntity>* entities = nullptr;
+                bool is_sink_input = false;
+                bool is_source_output = false;
+                
+                if (node->Outputs.size() && node->Outputs[0].Type == PinType::SinkInput) {
+                    entities = &m_AvailableSinkInputs;
+                    is_sink_input = true;
+                } else if (node->Inputs.size() && node->Inputs[0].Type == PinType::SourceOutput) {
+                    entities = &m_AvailableSourceOutputs;
+                    is_source_output = true;
+                } else if (node->Inputs.size() && node->Inputs[0].Type == PinType::Sink) {
+                    entities = &m_AvailableSinks;
+                } else if (node->Outputs.size() && node->Outputs[0].Type == PinType::Source) {
+                    entities = &m_AvailableSources;
+                }
+
+                if (entities && entities->size() > 0) {
+                    int current_idx = -1;
+                    for (size_t i = 0; i < entities->size(); ++i) {
+                        if ((*entities)[i].ID == node->PA_ID) {
+                            current_idx = i;
+                            break;
+                        }
+                    }
+                    const char* current_name = current_idx >= 0 ? (*entities)[current_idx].Name.c_str() : "Unknown";
+                    
+                    ImGui::SetNextItemWidth(paneWidth - 20);
+                    if (ImGui::BeginCombo("##pa_combo", current_name)) {
+                        for (size_t i = 0; i < entities->size(); ++i) {
+                            bool is_selected = (current_idx == (int)i);
+                            if (ImGui::Selectable((*entities)[i].Name.c_str(), is_selected)) {
+                                node->PA_ID = (*entities)[i].ID;
+                                node->Name = (*entities)[i].Name;
+                            }
+                            if (is_selected) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                } else {
+                    ImGui::Text("No entities available.");
+                }
                 
                 ImGui::Spacing();
-                ImGui::TextWrapped("You selected %s for node %s.", options[node->DemoOption], node->Name.c_str());
+                ImGui::Separator();
+                ImGui::Spacing();
+
             }
         }
         else
@@ -415,11 +568,22 @@ struct Example:
             ImGui::Text("No node selected.");
         }
 
+        
+        ImGui::Spacing();
+        if (ImGui::Button("Refresh Graph", ImVec2(paneWidth - 20, 30))) {
+            m_WantsRefresh = true;
+        }
         ImGui::EndChild();
+
     }
 
     void OnFrame(float deltaTime) override
     {
+        if (m_WantsRefresh) {
+            RefreshGraph();
+            m_WantsRefresh = false;
+        }
+
         UpdateTouch();
 
         ed::SetCurrentEditor(m_Editor);
@@ -565,12 +729,12 @@ struct Example:
                                 showLabel("+ Create Link", ImColor(32, 45, 32, 180));
                                 if (ed::AcceptNewItem(ImColor(128, 255, 128), 4.0f))
                                 {
-                                    if (startPin->Type == PinType::SourceOutput || startPin->Node->Name == "Loopback")
+                                    if (startPin->Type == PinType::SourceOutput || startPin->Node->Name == "Loopback" || startPin->Type == PinType::SinkInput)
                                     {
                                         m_Links.erase(std::remove_if(m_Links.begin(), m_Links.end(),
                                             [startPinId](const Link& l) { return l.StartPinID == startPinId || l.EndPinID == startPinId; }), m_Links.end());
                                     }
-                                    if (endPin->Type == PinType::SourceOutput || endPin->Node->Name == "Loopback")
+                                    if (endPin->Type == PinType::SourceOutput || endPin->Node->Name == "Loopback" || endPin->Type == PinType::SinkInput)
                                     {
                                         m_Links.erase(std::remove_if(m_Links.begin(), m_Links.end(),
                                             [endPinId](const Link& l) { return l.StartPinID == endPinId || l.EndPinID == endPinId; }), m_Links.end());
@@ -578,6 +742,27 @@ struct Example:
 
                                     m_Links.emplace_back(Link(GetNextId(), startPinId, endPinId));
                                     m_Links.back().Color = GetIconColor(startPin->Type);
+
+                                    // Run pactl command
+                                    if (startPin->Type == PinType::SinkInput || endPin->Type == PinType::SinkInput) {
+                                        Pin* sinkInputPin = startPin->Type == PinType::SinkInput ? startPin : endPin;
+                                        Pin* sinkPin = startPin->Type == PinType::Sink ? startPin : endPin;
+                                        if (sinkInputPin && sinkPin) {
+                                            char cmd[256];
+                                            snprintf(cmd, sizeof(cmd), "pactl move-sink-input %u %u", sinkInputPin->Node->PA_ID, sinkPin->Node->PA_ID);
+                                            ExecCommand(cmd);
+                                        }
+                                    }
+                                    
+                                    if (startPin->Type == PinType::SourceOutput || endPin->Type == PinType::SourceOutput) {
+                                        Pin* sourceOutputPin = startPin->Type == PinType::SourceOutput ? startPin : endPin;
+                                        Pin* sourcePin = startPin->Type == PinType::Source ? startPin : endPin;
+                                        if (sourceOutputPin && sourcePin) {
+                                            char cmd[256];
+                                            snprintf(cmd, sizeof(cmd), "pactl move-source-output %u %u", sourceOutputPin->Node->PA_ID, sourcePin->Node->PA_ID);
+                                            ExecCommand(cmd);
+                                        }
+                                    }
                                 }
                             }
                         }
