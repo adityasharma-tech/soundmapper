@@ -242,7 +242,7 @@ struct Example:
 
         bool validSink = (a->Type == PinType::SinkInput && b->Type == PinType::Sink) ||
                          (b->Type == PinType::SinkInput && a->Type == PinType::Sink);
-        
+
         bool validSource = (a->Type == PinType::SourceOutput && b->Type == PinType::Source) ||
                            (b->Type == PinType::SourceOutput && a->Type == PinType::Source);
 
@@ -312,8 +312,8 @@ struct Example:
     }
 
 
-    
-    
+
+
     std::string ParseDetails(const json& item) {
         std::string details;
         auto add_str = [&](const char* key, const char* label) {
@@ -338,7 +338,7 @@ struct Example:
         add_str("buffer_latency_usec", "Buffer Latency (us)");
         add_str("sink_latency_usec", "Sink Latency (us)");
         add_str("resample_method", "Resample Method");
-        
+
         if (item.contains("volume") && item["volume"].is_object()) {
             details += "Volume:\n";
             for (auto iter = item["volume"].begin(); iter != item["volume"].end(); ++iter) {
@@ -359,7 +359,7 @@ struct Example:
         m_AvailableSources.clear();
         m_AvailableSinkInputs.clear();
         m_AvailableSourceOutputs.clear();
-        
+
         std::string sinks_json = ExecCommand("pactl -f json list sinks");
         std::string sources_json = ExecCommand("pactl -f json list sources");
         std::string sink_inputs_json = ExecCommand("pactl -f json list sink-inputs");
@@ -462,7 +462,7 @@ struct Example:
                     // Find if this source monitors a sink
                     uint32_t source_id = s.value("index", 0);
                     std::string source_pa_name = s.value("name", "");
-                    
+
                     // Check monitor_of_sink field if available, otherwise match by name
                     for (auto& sk : sinks) {
                         std::string sink_monitor = sk.value("monitor_source", "");
@@ -495,7 +495,7 @@ struct Example:
     {
         ed::Config config;
 
-        config.SettingsFile = "Blueprints.json";
+        config.SettingsFile = "/home/friday/.data/soundmapper/build/bin/Blueprints.json";
 
         config.UserPointer = this;
 
@@ -578,9 +578,9 @@ struct Example:
     void ShowLeftPane(float paneWidth)
     {
         auto& io = ImGui::GetIO();
-        
+
         ImGui::BeginChild("LeftPane", ImVec2(paneWidth, 0));
-        
+
         ImGui::BeginChild("Selection", ImVec2(paneWidth, -150.0f));
         paneWidth = ImGui::GetContentRegionAvail().x;
 
@@ -611,7 +611,7 @@ struct Example:
                 std::vector<PAEntity>* entities = nullptr;
                 bool is_sink_input = false;
                 bool is_source_output = false;
-                
+
                 if (node->Outputs.size() && node->Outputs[0].Type == PinType::SinkInput) {
                     entities = &m_AvailableSinkInputs;
                     is_sink_input = true;
@@ -633,7 +633,7 @@ struct Example:
                         }
                     }
                     const char* current_name = current_idx >= 0 ? (*entities)[current_idx].Name.c_str() : "Unknown";
-                    
+
                     ImGui::SetNextItemWidth(paneWidth - 20);
                     if (ImGui::BeginCombo("##pa_combo", current_name)) {
                         for (size_t i = 0; i < entities->size(); ++i) {
@@ -649,11 +649,11 @@ struct Example:
                 } else {
                     ImGui::Text("No entities available.");
                 }
-                
+
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
-                
+
                 ImGui::Text("Properties:");
                 ImGui::TextWrapped("%s", node->Details.c_str());
 
@@ -665,7 +665,7 @@ struct Example:
         }
 
         ImGui::EndChild();
-        
+
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("Global Actions:");
@@ -860,7 +860,7 @@ struct Example:
                                             ExecCommand(cmd);
                                         }
                                     }
-                                    
+
                                     // Run pactl command for source-output -> source
                                     if (startPin->Type == PinType::SourceOutput || endPin->Type == PinType::SourceOutput) {
                                         Pin* sourceOutputPin = startPin->Type == PinType::SourceOutput ? startPin : endPin;
