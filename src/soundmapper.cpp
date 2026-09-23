@@ -2,6 +2,7 @@
 #include <application.h>
 #include "utilities/builders.h"
 #include "utilities/widgets.h"
+#include "routing_engine.h"
 
 #include <imgui_node_editor.h>
 
@@ -31,6 +32,13 @@ std::string ExecCommand(const char* cmd) {
 #include <map>
 #include <algorithm>
 #include <utility>
+#include <sstream>
+#include <set>
+#include <fstream>
+#include <chrono>
+#include <iomanip>
+#include <ctime>
+#include <sys/wait.h>
 
 
 namespace ed = ax::NodeEditor;
@@ -41,14 +49,19 @@ using namespace ax;
 using ax::Widgets::IconType;
 
 static ed::EditorContext* m_Editor = nullptr;
+static const char* kLogPath = "/home/friday/.data/soundmapper/soundmapper.log";
 
-enum class PinType
+static void LogMessage(const std::string& message)
 {
-    SinkInput,
-    SourceOutput,
-    Sink,
-    Source
-};
+    std::ofstream log(kLogPath, std::ios::app);
+    if (!log)
+        return;
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    log << std::put_time(std::localtime(&now), "%F %T") << " " << message << "\n";
+}
+
+using PinType = soundmapper::EndpointType;
+using RouteType = soundmapper::RouteType;
 
 enum class PinKind
 {
@@ -100,6 +113,22 @@ struct Node
     }
 };
 
+enum class RouteResourceType
+{
+    NullSink,
+    Loopback
+};
+
+struct RouteResource
+{
+    RouteResourceType Type;
+    uint32_t PA_Module_ID;
+    std::string PA_Name;
+
+    RouteResource(RouteResourceType type, uint32_t moduleId = 0, const std::string& name = "")
+        : Type(type), PA_Module_ID(moduleId), PA_Name(name) {}
+};
+
 struct Link
 {
     ed::LinkId ID;
@@ -108,10 +137,14 @@ struct Link
     ed::PinId EndPinID;
 
     ImColor Color;
-    uint32_t PA_Module_ID;
+    RouteType Type;
+    std::vector<RouteResource> Resources;
+    bool Managed;
+    uint32_t PreviousSinkID;
+    uint32_t PreviousSourceID;
 
     Link(ed::LinkId id, ed::PinId startPinId, ed::PinId endPinId):
-        ID(id), StartPinID(startPinId), EndPinID(endPinId), Color(255, 255, 255), PA_Module_ID(0)
+        ID(id), StartPinID(startPinId), EndPinID(endPinId), Color(255, 255, 255), Type(RouteType::Invalid), Managed(false), PreviousSinkID(static_cast<uint32_t>(-1)), PreviousSourceID(static_cast<uint32_t>(-1))
     {
     }
 };
@@ -240,19 +273,599 @@ struct Example:
         if (!a || !b || a == b || a->Kind == b->Kind || a->Node == b->Node)
             return false;
 
-        bool validSink = (a->Type == PinType::SinkInput && b->Type == PinType::Sink) ||
-                         (b->Type == PinType::SinkInput && a->Type == PinType::Sink);
+        return soundmapper::RoutingEngine::CanConnect(a->Type, b->Type);
+    }
 
-        bool validSource = (a->Type == PinType::SourceOutput && b->Type == PinType::Source) ||
-                           (b->Type == PinType::SourceOutput && a->Type == PinType::Source);
+    RouteType GetRouteType(Pin* a, Pin* b) const
+    {
+        return a && b ? soundmapper::RoutingEngine::Decide(a->Type, b->Type)
+                      : RouteType::Invalid;
+    }
 
-        bool validLoopback = (a->Type == PinType::Source && b->Type == PinType::Sink) ||
-                             (b->Type == PinType::Source && a->Type == PinType::Sink);
+    static const char* RouteName(RouteType type)
+    {
+        switch (type)
+        {
+        case RouteType::PlaybackToSink: return "playback-to-sink";
+        case RouteType::SourceToCapture: return "source-to-capture";
+        case RouteType::SourceToSink: return "source-to-sink";
+        case RouteType::PlaybackToCapture: return "playback-to-capture";
+        default: return "invalid";
+        }
+    }
 
-        if (!validSink && !validSource && !validLoopback)
+    static std::string DescribePin(const Pin* pin)
+    {
+        if (!pin || !pin->Node)
+            return "<missing pin>";
+        return pin->Node->Name + " (id=" + std::to_string(pin->Node->PA_ID) + ")";
+    }
+
+    static std::string ShellQuote(const std::string& value)
+    {
+        std::string out = "'";
+        for (char c : value)
+        {
+            if (c == '\'')
+                out += "'\\''";
+            else
+                out += c;
+        }
+        out += "'";
+        return out;
+    }
+
+    bool ExecPactl(const std::string& command, std::string& output)
+    {
+        output.clear();
+        std::string fullCommand = command + " 2>&1";
+        FILE* pipe = popen(fullCommand.c_str(), "r");
+        if (!pipe)
+        {
+            LogMessage("pactl spawn failed: " + command);
+            return false;
+        }
+
+        std::array<char, 256> buffer;
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
+            output += buffer.data();
+
+        int status = pclose(pipe);
+        const bool success = status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        LogMessage("pactl success=" + std::string(success ? "true" : "false") +
+                   " status=" + std::to_string(status) + " command=" + command +
+                   " output=" + output);
+        return success;
+    }
+
+    bool PactlMoveSinkInput(uint32_t sinkInputID, uint32_t sinkID)
+    {
+        std::string output;
+        return ExecPactl("pactl move-sink-input " + std::to_string(sinkInputID) + " " + std::to_string(sinkID), output);
+    }
+
+    bool PactlMoveSourceOutput(uint32_t sourceOutputID, uint32_t sourceID)
+    {
+        std::string output;
+        return ExecPactl("pactl move-source-output " + std::to_string(sourceOutputID) + " " + std::to_string(sourceID), output);
+    }
+
+    bool PactlCreateNullSink(const std::string& sinkName, const std::string& description, uint32_t& moduleID)
+    {
+        std::string output;
+        std::string propertyValue = description;
+        std::replace(propertyValue.begin(), propertyValue.end(), ' ', '_');
+        std::string command = "pactl load-module module-null-sink sink_name=" + sinkName +
+                              " sink_properties=device.description=" + propertyValue;
+        if (!ExecPactl(command, output))
             return false;
 
-        return true;
+        std::istringstream iss(output);
+        return static_cast<bool>(iss >> moduleID);
+    }
+
+    bool PactlCreateLoopback(const std::string& sourceName, const std::string& sinkName, uint32_t& moduleID)
+    {
+        std::string output;
+        std::string command = "pactl load-module module-loopback source=" + ShellQuote(sourceName) +
+                              " sink=" + ShellQuote(sinkName);
+        if (!ExecPactl(command, output))
+            return false;
+
+        std::istringstream iss(output);
+        return static_cast<bool>(iss >> moduleID);
+    }
+
+    bool PactlUnloadModule(uint32_t moduleID)
+    {
+        if (!moduleID)
+            return true;
+        std::string output;
+        return ExecPactl("pactl unload-module " + std::to_string(moduleID), output);
+    }
+
+    bool FindSinkByName(const std::string& name, uint32_t* id = nullptr)
+    {
+        std::string output = ExecCommand("pactl -f json list sinks");
+        try
+        {
+            auto items = json::parse(output);
+            for (auto& item : items)
+            {
+                if (item.value("name", "") == name)
+                {
+                    if (id) *id = item.value("index", 0u);
+                    return true;
+                }
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+
+    bool FindSourceByName(const std::string& name, uint32_t* id = nullptr)
+    {
+        std::string output = ExecCommand("pactl -f json list sources");
+        try
+        {
+            auto items = json::parse(output);
+            for (auto& item : items)
+            {
+                if (item.value("name", "") == name)
+                {
+                    if (id) *id = item.value("index", 0u);
+                    return true;
+                }
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+
+    bool GetCurrentSinkForSinkInput(uint32_t sinkInputID, uint32_t& sinkID)
+    {
+        std::string output = ExecCommand("pactl -f json list sink-inputs");
+        try
+        {
+            auto items = json::parse(output);
+            for (auto& item : items)
+            {
+                if (item.value("index", 0u) == sinkInputID)
+                {
+                    sinkID = item.value("sink", static_cast<uint32_t>(-1));
+                    return sinkID != static_cast<uint32_t>(-1);
+                }
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+
+    bool GetCurrentSourceForSourceOutput(uint32_t sourceOutputID, uint32_t& sourceID)
+    {
+        std::string output = ExecCommand("pactl -f json list source-outputs");
+        try
+        {
+            auto items = json::parse(output);
+            for (auto& item : items)
+            {
+                if (item.value("index", 0u) == sourceOutputID)
+                {
+                    sourceID = item.value("source", static_cast<uint32_t>(-1));
+                    return sourceID != static_cast<uint32_t>(-1);
+                }
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+
+    bool VerifySinkInput(uint32_t sinkInputID, uint32_t expectedSinkID)
+    {
+        std::string output = ExecCommand("pactl -f json list sink-inputs");
+        try
+        {
+            auto items = json::parse(output);
+            for (auto& item : items)
+            {
+                if (item.value("index", 0u) == sinkInputID)
+                    return item.value("sink", static_cast<uint32_t>(-1)) == expectedSinkID;
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+
+    bool VerifySourceOutput(uint32_t sourceOutputID, uint32_t expectedSourceID)
+    {
+        std::string output = ExecCommand("pactl -f json list source-outputs");
+        try
+        {
+            auto items = json::parse(output);
+            for (auto& item : items)
+            {
+                if (item.value("index", 0u) == sourceOutputID)
+                    return item.value("source", static_cast<uint32_t>(-1)) == expectedSourceID;
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+
+    bool VerifyLoopback(uint32_t moduleID, const std::string& sourceName, const std::string& sinkName)
+    {
+        std::string output = ExecCommand("pactl -f json list modules");
+        try
+        {
+            auto items = json::parse(output);
+            for (auto& item : items)
+            {
+                if (item.value("index", 0u) != moduleID)
+                    continue;
+
+                if (item.value("name", "") != "module-loopback")
+                    return false;
+
+                std::string args = item.value("argument", item.value("args", ""));
+                return args.find("source=" + sourceName) != std::string::npos &&
+                       args.find("sink=" + sinkName) != std::string::npos;
+            }
+        }
+        catch (...) {}
+
+        // Some pactl versions do not expose module JSON. Fall back to the
+        // human-readable module list, still requiring the exact module ID and
+        // both endpoint names.
+        output = ExecCommand("pactl list modules");
+        std::istringstream lines(output);
+        std::string line;
+        bool inModule = false;
+        bool idOK = false;
+        bool nameOK = false;
+        bool sourceOK = false;
+        bool sinkOK = false;
+        while (std::getline(lines, line))
+        {
+            if (line.rfind("Module #", 0) == 0)
+            {
+                if (inModule && idOK)
+                    return nameOK && sourceOK && sinkOK;
+                inModule = true;
+                idOK = line.find("#" + std::to_string(moduleID)) != std::string::npos;
+                nameOK = sourceOK = sinkOK = false;
+            }
+            if (!inModule || !idOK)
+                continue;
+            if (line.find("Name: module-loopback") != std::string::npos) nameOK = true;
+            if (line.find("source=") != std::string::npos && line.find(sourceName) != std::string::npos) sourceOK = true;
+            if (line.find("sink=") != std::string::npos && line.find(sinkName) != std::string::npos) sinkOK = true;
+        }
+        return inModule && idOK && nameOK && sourceOK && sinkOK;
+    }
+
+    bool VerifyNullSink(const std::string& sinkName, std::string& monitorName, uint32_t* sinkID = nullptr)
+    {
+        std::string output = ExecCommand("pactl -f json list sinks");
+        try
+        {
+            auto items = json::parse(output);
+            for (auto& item : items)
+            {
+                if (item.value("name", "") == sinkName)
+                {
+                    if (sinkID) *sinkID = item.value("index", 0u);
+                    monitorName = item.value("monitor_source", "");
+                    if (monitorName.empty())
+                        monitorName = sinkName + ".monitor";
+                    return FindSourceByName(monitorName);
+                }
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+
+    bool ApplyRoute(Pin* a, Pin* b, Link& link)
+    {
+        Pin* sinkInput = nullptr;
+        Pin* sourceOutput = nullptr;
+        Pin* sink = nullptr;
+        Pin* source = nullptr;
+
+        if (a->Type == PinType::SinkInput) sinkInput = a;
+        if (b->Type == PinType::SinkInput) sinkInput = b;
+        if (a->Type == PinType::SourceOutput) sourceOutput = a;
+        if (b->Type == PinType::SourceOutput) sourceOutput = b;
+        if (a->Type == PinType::Sink) sink = a;
+        if (b->Type == PinType::Sink) sink = b;
+        if (a->Type == PinType::Source) source = a;
+        if (b->Type == PinType::Source) source = b;
+
+        link.Type = GetRouteType(a, b);
+        LogMessage("route attempt type=" + std::string(RouteName(link.Type)) +
+                   " from=" + DescribePin(a) + " to=" + DescribePin(b));
+        auto fail = [&](const char* reason)
+        {
+            LogMessage("route failed type=" + std::string(RouteName(link.Type)) + " reason=" + reason);
+            return false;
+        };
+        if (link.Type == RouteType::Invalid)
+        {
+            return fail("invalid endpoint combination");
+        }
+
+        if (link.Type == RouteType::PlaybackToSink)
+        {
+            if (!GetCurrentSinkForSinkInput(sinkInput->Node->PA_ID, link.PreviousSinkID))
+                return fail("cannot read current sink-input destination");
+            if (!PactlMoveSinkInput(sinkInput->Node->PA_ID, sink->Node->PA_ID))
+                return fail("move-sink-input command failed");
+            if (!VerifySinkInput(sinkInput->Node->PA_ID, sink->Node->PA_ID))
+                return fail("sink-input destination verification failed");
+            link.Managed = true;
+            LogMessage("route applied type=playback-to-sink");
+            return true;
+        }
+
+        if (link.Type == RouteType::SourceToCapture)
+        {
+            if (!GetCurrentSourceForSourceOutput(sourceOutput->Node->PA_ID, link.PreviousSourceID))
+                return fail("cannot read current source-output source");
+            if (!PactlMoveSourceOutput(sourceOutput->Node->PA_ID, source->Node->PA_ID))
+                return fail("move-source-output command failed");
+            if (!VerifySourceOutput(sourceOutput->Node->PA_ID, source->Node->PA_ID))
+                return fail("source-output source verification failed");
+            link.Managed = true;
+            LogMessage("route applied type=source-to-capture");
+            return true;
+        }
+
+        if (link.Type == RouteType::SourceToSink)
+        {
+            uint32_t moduleID = 0;
+            if (!PactlCreateLoopback(source->Node->PA_Name, sink->Node->PA_Name, moduleID))
+                return fail("loopback module creation failed");
+
+            if (!VerifyLoopback(moduleID, source->Node->PA_Name, sink->Node->PA_Name))
+            {
+                PactlUnloadModule(moduleID);
+                return fail("loopback module verification failed");
+            }
+
+            link.Resources.emplace_back(RouteResourceType::Loopback, moduleID);
+            link.Managed = true;
+            LogMessage("route applied type=source-to-sink module=" + std::to_string(moduleID));
+            return true;
+        }
+
+        if (link.Type == RouteType::PlaybackToCapture)
+        {
+            // Playback -> Capture is implemented as:
+            //
+            //   SinkInput -> Soundmapper null sink -> null sink monitor
+            //              -> SourceOutput
+            //
+            // A SourceOutput can have only one source, so multiple playback
+            // streams targeting the same capture application share one bus.
+            std::string busName;
+            uint32_t busID = 0;
+            uint32_t monitorID = 0;
+            std::string monitorName;
+            uint32_t sharedModuleID = 0;
+            uint32_t sharedPreviousSourceID = static_cast<uint32_t>(-1);
+            bool reusedBus = false;
+
+            for (const auto& existing : m_Links)
+            {
+                if (existing.Type != RouteType::PlaybackToCapture ||
+                    existing.EndPinID != sourceOutput->ID && existing.StartPinID != sourceOutput->ID)
+                    continue;
+
+                for (const auto& resource : existing.Resources)
+                {
+                    if (resource.Type == RouteResourceType::NullSink && !resource.PA_Name.empty())
+                    {
+                        busName = resource.PA_Name;
+                        sharedModuleID = resource.PA_Module_ID;
+                        sharedPreviousSourceID = existing.PreviousSourceID;
+                        reusedBus = true;
+                        break;
+                    }
+                }
+                if (reusedBus)
+                    break;
+            }
+
+            if (!reusedBus)
+                busName = "soundmapper_bus_" + std::to_string(static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(link.ID.AsPointer())));
+
+            if (!VerifyNullSink(busName, monitorName, &busID))
+            {
+                uint32_t moduleID = 0;
+                if (!PactlCreateNullSink(busName, "Soundmapper Bus", moduleID))
+                    return fail("virtual bus creation failed");
+
+                link.Resources.emplace_back(RouteResourceType::NullSink, moduleID, busName);
+
+                if (!VerifyNullSink(busName, monitorName, &busID))
+                {
+                    RemoveRouteResources(link);
+                    return fail("virtual bus verification failed");
+                }
+            }
+
+            if (!GetCurrentSinkForSinkInput(sinkInput->Node->PA_ID, link.PreviousSinkID))
+            {
+                if (!reusedBus)
+                    RemoveRouteResources(link);
+                return fail("cannot read current sink-input destination");
+            }
+
+            if (reusedBus)
+            {
+                link.PreviousSourceID = sharedPreviousSourceID;
+                link.Resources.emplace_back(RouteResourceType::NullSink, sharedModuleID, busName);
+            }
+
+            if (!PactlMoveSinkInput(sinkInput->Node->PA_ID, busID) ||
+                !VerifySinkInput(sinkInput->Node->PA_ID, busID))
+            {
+                if (!reusedBus)
+                    RemoveRouteResources(link);
+                return fail("move-sink-input or verification failed");
+            }
+
+            if (!FindSourceByName(monitorName, &monitorID))
+            {
+                if (!reusedBus)
+                    RemoveRouteResources(link);
+                return fail("cannot find virtual bus monitor");
+            }
+
+            if (!reusedBus)
+            {
+                Pin* currentSource = nullptr;
+                for (const auto& existing : m_Links)
+                {
+                    if (existing.Type != RouteType::SourceToCapture)
+                        continue;
+                    Pin* existingStart = FindPin(existing.StartPinID);
+                    Pin* existingEnd = FindPin(existing.EndPinID);
+                    if (existingStart && existingStart->Type == PinType::Source &&
+                        existingEnd == sourceOutput)
+                    {
+                        currentSource = existingStart;
+                        break;
+                    }
+                }
+
+                if (currentSource)
+                {
+                    uint32_t loopbackModuleID = 0;
+                    if (!PactlCreateLoopback(currentSource->Node->PA_Name, busName, loopbackModuleID) ||
+                        !VerifyLoopback(loopbackModuleID, currentSource->Node->PA_Name, busName))
+                    {
+                        if (loopbackModuleID)
+                            PactlUnloadModule(loopbackModuleID);
+                        RemoveRouteResources(link);
+                        return fail("existing source loopback creation or verification failed");
+                    }
+                    link.Resources.emplace_back(RouteResourceType::Loopback, loopbackModuleID);
+                    LogMessage("playback-to-capture mixed existing source=" + DescribePin(currentSource));
+                }
+
+                if (!GetCurrentSourceForSourceOutput(sourceOutput->Node->PA_ID, link.PreviousSourceID))
+                {
+                    RemoveRouteResources(link);
+                    return fail("cannot read current source-output source");
+                }
+
+                // First route owns the bus and must attach the target capture
+                // stream to its monitor. Subsequent routes reuse that same
+                // source, so moving the SourceOutput again is unnecessary.
+                if (!PactlMoveSourceOutput(sourceOutput->Node->PA_ID, monitorID) ||
+                    !VerifySourceOutput(sourceOutput->Node->PA_ID, monitorID))
+                {
+                    RemoveRouteResources(link);
+                    return fail("move-source-output or verification failed");
+                }
+            }
+            else if (!VerifySourceOutput(sourceOutput->Node->PA_ID, monitorID))
+            {
+                return fail("shared virtual bus source-output verification failed");
+            }
+
+            link.Managed = true;
+            LogMessage("route applied type=playback-to-capture bus=" + busName);
+            return true;
+        }
+        return fail("no implementation");
+    }
+
+    void RestoreRouteEndpoints(Link& link)
+    {
+        Pin* startPin = FindPin(link.StartPinID);
+        Pin* endPin = FindPin(link.EndPinID);
+        Pin* sinkInput = nullptr;
+        Pin* sourceOutput = nullptr;
+
+        if (startPin && startPin->Type == PinType::SinkInput) sinkInput = startPin;
+        if (endPin && endPin->Type == PinType::SinkInput) sinkInput = endPin;
+        if (startPin && startPin->Type == PinType::SourceOutput) sourceOutput = startPin;
+        if (endPin && endPin->Type == PinType::SourceOutput) sourceOutput = endPin;
+
+        if (sinkInput && link.PreviousSinkID != static_cast<uint32_t>(-1))
+            PactlMoveSinkInput(sinkInput->Node->PA_ID, link.PreviousSinkID);
+
+        if (sourceOutput && link.PreviousSourceID != static_cast<uint32_t>(-1))
+        {
+            bool sharedCaptureRoute = false;
+            if (link.Type == RouteType::PlaybackToCapture)
+            {
+                for (const auto& other : m_Links)
+                {
+                    if (&other == &link || other.Type != RouteType::PlaybackToCapture)
+                        continue;
+                    if (other.StartPinID == sourceOutput->ID || other.EndPinID == sourceOutput->ID)
+                    {
+                        sharedCaptureRoute = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!sharedCaptureRoute)
+                PactlMoveSourceOutput(sourceOutput->Node->PA_ID, link.PreviousSourceID);
+        }
+    }
+
+    void RemoveRouteResources(Link& link)
+    {
+        for (auto it = link.Resources.rbegin(); it != link.Resources.rend(); ++it)
+        {
+            bool shared = false;
+            if (it->Type == RouteResourceType::NullSink && !it->PA_Name.empty())
+            {
+                for (const auto& other : m_Links)
+                {
+                    if (&other == &link)
+                        continue;
+                    for (const auto& otherResource : other.Resources)
+                    {
+                        if (otherResource.Type == RouteResourceType::NullSink &&
+                            otherResource.PA_Name == it->PA_Name)
+                        {
+                            shared = true;
+                            break;
+                        }
+                    }
+                    if (shared)
+                        break;
+                }
+            }
+
+            if (!shared)
+                PactlUnloadModule(it->PA_Module_ID);
+        }
+        link.Resources.clear();
+    }
+
+    void RemoveLinksUsingPin(ed::PinId pinId)
+    {
+        for (auto it = m_Links.begin(); it != m_Links.end();)
+        {
+            if (it->StartPinID == pinId || it->EndPinID == pinId)
+            {
+                if (it->Managed)
+                {
+                    RestoreRouteEndpoints(*it);
+                    RemoveRouteResources(*it);
+                }
+                it = m_Links.erase(it);
+            }
+            else
+                ++it;
+        }
     }
 
     void BuildNode(Node* node)
@@ -350,10 +963,164 @@ struct Example:
         return details;
     }
 
+    static bool IsSoundmapperBusName(const std::string& name)
+    {
+        return name.rfind("soundmapper_bus_", 0) == 0;
+    }
+
+    static bool IsSoundmapperInternalSource(const std::string& name)
+    {
+        // Every Soundmapper bus exposes a monitor source.  These are
+        // implementation details and must not become user-visible graph nodes.
+        return name.rfind("soundmapper_bus_", 0) == 0 &&
+               name.size() >= std::string("soundmapper_bus_").size() + 8 &&
+               name.find(".monitor") != std::string::npos;
+    }
+
+    static bool IsMonitorSource(const json& source)
+    {
+        const std::string name = source.value("name", "");
+        const bool nameIsMonitor = name.size() >= 8 &&
+            name.compare(name.size() - 8, 8, ".monitor") == 0;
+        const bool classIsMonitor = source.contains("properties") &&
+            source["properties"].value("device.class", "") == "monitor";
+        return nameIsMonitor || classIsMonitor;
+    }
+
+    uint32_t GetDefaultSinkID()
+    {
+        std::string name = ExecCommand("pactl get-default-sink");
+        while (!name.empty() && (name.back() == '\n' || name.back() == '\r' || name.back() == ' ' || name.back() == '\t'))
+            name.pop_back();
+        uint32_t id = static_cast<uint32_t>(-1);
+        return FindSinkByName(name, &id) ? id : static_cast<uint32_t>(-1);
+    }
+
+    uint32_t GetDefaultSourceID()
+    {
+        std::string name = ExecCommand("pactl get-default-source");
+        while (!name.empty() && (name.back() == '\n' || name.back() == '\r' || name.back() == ' ' || name.back() == '\t'))
+            name.pop_back();
+        uint32_t id = static_cast<uint32_t>(-1);
+        return FindSourceByName(name, &id) ? id : static_cast<uint32_t>(-1);
+    }
+
+    Link* AddGraphLink(Pin* a, Pin* b, RouteType type, bool managed = false,
+                       uint32_t moduleID = 0, const std::string& resourceName = "")
+    {
+        if (!a || !b || !CanCreateLink(a, b) || type == RouteType::Invalid)
+            return nullptr;
+
+        // The graph has a stable visual convention: audio always flows from
+        // Output -> Input, regardless of which endpoint the user dragged from.
+        Pin* start = a;
+        Pin* end = b;
+        if (start->Kind == PinKind::Input)
+            std::swap(start, end);
+
+        // Avoid duplicate logical edges after a PulseAudio rescan.
+        for (const auto& existing : m_Links)
+        {
+            if (existing.StartPinID == start->ID && existing.EndPinID == end->ID)
+                return &const_cast<Link&>(existing);
+        }
+
+        Link link(GetNextId(), start->ID, end->ID);
+        link.Color = GetIconColor(start->Type);
+        link.Type = type;
+        link.Managed = managed;
+        if (moduleID)
+        {
+            RouteResourceType resourceType =
+                type == RouteType::SourceToSink ? RouteResourceType::Loopback : RouteResourceType::NullSink;
+            link.Resources.emplace_back(resourceType, moduleID, resourceName);
+        }
+        m_Links.emplace_back(std::move(link));
+        return &m_Links.back();
+    }
+
+    static std::string ModuleArgument(const std::string& args, const std::string& key)
+    {
+        // pactl's module argument syntax is key=value. Names generated by
+        // Soundmapper contain no spaces, so this intentionally stays simple.
+        const std::string needle = key + "=";
+        size_t pos = args.find(needle);
+        if (pos == std::string::npos)
+            return {};
+        pos += needle.size();
+
+        if (pos < args.size() && args[pos] == '\'')
+        {
+            ++pos;
+            size_t end = args.find('\'', pos);
+            return args.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        }
+
+        size_t end = args.find_first_of(" \t\n", pos);
+        return args.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    }
+
+    struct ModuleInfo
+    {
+        uint32_t ID = 0;
+        std::string Name;
+        std::string Args;
+    };
+
+    std::vector<ModuleInfo> GetPulseModules()
+    {
+        std::vector<ModuleInfo> modules;
+        std::string output = ExecCommand("pactl list modules");
+        std::istringstream stream(output);
+        std::string line;
+        ModuleInfo current;
+        bool have = false;
+
+        auto flush = [&]()
+        {
+            if (have)
+                modules.push_back(current);
+            current = ModuleInfo{};
+            have = false;
+        };
+
+        while (std::getline(stream, line))
+        {
+            if (line.rfind("Module #", 0) == 0)
+            {
+                flush();
+                try
+                {
+                    current.ID = static_cast<uint32_t>(std::stoul(line.substr(8)));
+                    have = true;
+                }
+                catch (...) {}
+            }
+            else if (have && line.rfind("Name:", 0) == 0)
+            {
+                current.Name = line.substr(5);
+                while (!current.Name.empty() && current.Name.front() == ' ')
+                    current.Name.erase(current.Name.begin());
+            }
+            else if (have && line.rfind("Argument:", 0) == 0)
+            {
+                current.Args = line.substr(9);
+                while (!current.Args.empty() && current.Args.front() == ' ')
+                    current.Args.erase(current.Args.begin());
+            }
+        }
+        flush();
+        return modules;
+    }
+
     void RefreshGraph()
     {
+        // A refresh rebuilds the *logical* graph from the current PulseAudio
+        // state. Internal Soundmapper buses/monitors are deliberately hidden;
+        // the user sees SinkInput -> SourceOutput instead of the null-sink
+        // implementation used underneath.
         m_Nodes.clear();
-        m_Nodes.reserve(1000); // Prevent reallocation invalidating Node* pointers
+        m_Nodes.reserve(1000);
         m_Links.clear();
         m_AvailableSinks.clear();
         m_AvailableSources.clear();
@@ -365,121 +1132,233 @@ struct Example:
         std::string sink_inputs_json = ExecCommand("pactl -f json list sink-inputs");
         std::string source_outputs_json = ExecCommand("pactl -f json list source-outputs");
 
-        try {
+        try
+        {
             auto sinks = json::parse(sinks_json);
             auto sources = json::parse(sources_json);
             auto sink_inputs = json::parse(sink_inputs_json);
             auto source_outputs = json::parse(source_outputs_json);
+            LogMessage("refresh sinks=" + std::to_string(sinks.size()) +
+                       " sources=" + std::to_string(sources.size()) +
+                       " sink-inputs=" + std::to_string(sink_inputs.size()) +
+                       " source-outputs=" + std::to_string(source_outputs.size()));
 
             std::map<uint32_t, Node*> sink_nodes;
             std::map<uint32_t, Node*> source_nodes;
+            std::map<std::string, Node*> sink_name_nodes;
+            std::map<std::string, Node*> source_name_nodes;
+            std::set<uint32_t> hidden_sink_ids;
+            std::set<uint32_t> hidden_source_ids;
+            std::map<std::string, uint32_t> bus_sink_ids;
+            std::map<std::string, uint32_t> bus_monitor_ids;
 
             float y = 0;
-            for (auto& s : sinks) {
-                uint32_t id = s.value("index", 0);
-                std::string desc = s.value("description", s.value("name", "Unknown Sink"));
+            for (auto& s : sinks)
+            {
+                uint32_t id = s.value("index", 0u);
                 std::string pa_name = s.value("name", "");
+                std::string desc = s.value("description", pa_name.empty() ? "Unknown Sink" : pa_name);
+
+                if (IsSoundmapperBusName(pa_name))
+                {
+                    hidden_sink_ids.insert(id);
+                    bus_sink_ids[pa_name] = id;
+                    continue;
+                }
+
                 m_AvailableSinks.push_back({id, desc, pa_name});
                 Node* n = SpawnSinkNode(id, desc.c_str());
                 n->PA_Name = pa_name;
                 n->Details = ParseDetails(s);
                 ed::SetNodePosition(n->ID, ImVec2(500, y));
                 sink_nodes[id] = n;
+                sink_name_nodes[pa_name] = n;
                 y += 150;
             }
 
             y = 0;
-            for (auto& s : sources) {
-                uint32_t id = s.value("index", 0);
-                std::string desc = s.value("description", s.value("name", "Unknown Source"));
+            for (auto& s : sources)
+            {
+                uint32_t id = s.value("index", 0u);
                 std::string pa_name = s.value("name", "");
+                std::string desc = s.value("description", pa_name.empty() ? "Unknown Source" : pa_name);
+
+                if (IsSoundmapperInternalSource(pa_name))
+                {
+                    hidden_source_ids.insert(id);
+                    // Associate monitor source with the corresponding hidden bus.
+                    std::string busName = pa_name.substr(0, pa_name.find(".monitor"));
+                    bus_monitor_ids[busName] = id;
+                    continue;
+                }
+
+                // Hardware/output monitor sources are not useful routing
+                // choices in this simplified graph, so never expose them.
+                if (IsMonitorSource(s))
+                    continue;
+
                 m_AvailableSources.push_back({id, desc, pa_name});
                 Node* n = SpawnSourceNode(id, desc.c_str());
                 n->PA_Name = pa_name;
                 n->Details = ParseDetails(s);
                 ed::SetNodePosition(n->ID, ImVec2(-500, y));
                 source_nodes[id] = n;
+                source_name_nodes[pa_name] = n;
                 y += 150;
             }
 
+            std::map<uint32_t, Node*> sink_input_nodes;
+            std::map<uint32_t, Node*> source_output_nodes;
+            std::vector<std::pair<uint32_t, uint32_t>> playbackOnBus;
+            std::vector<std::pair<uint32_t, uint32_t>> captureOnBus;
+
             y = 0;
-            for (auto& si : sink_inputs) {
-                uint32_t id = si.value("index", 0);
+            for (auto& si : sink_inputs)
+            {
+                uint32_t id = si.value("index", 0u);
                 std::string name = si.value("name", "Unknown Sink-Input");
-                if (si.contains("properties")) {
-                    if (si["properties"].contains("application.name")) {
+                if (si.contains("properties"))
+                {
+                    if (si["properties"].contains("application.name"))
                         name = si["properties"]["application.name"];
-                    }
-                    if (si["properties"].contains("media.name")) {
+                    if (si["properties"].contains("media.name"))
+                    {
                         std::string media = si["properties"]["media.name"];
                         if (media.length() > 25) media = media.substr(0, 22) + "...";
                         name += " - " + media;
                     }
                 }
-                m_AvailableSinkInputs.push_back({id, name, ""});
+
+                std::string pa_name = si.value("name", name);
+                m_AvailableSinkInputs.push_back({id, name, pa_name});
                 Node* n = SpawnSinkInputNode(id, name.c_str());
+                n->PA_Name = pa_name;
                 n->Details = ParseDetails(si);
                 ed::SetNodePosition(n->ID, ImVec2(0, y));
+                sink_input_nodes[id] = n;
                 y += 150;
 
-                uint32_t target_sink = si.value("sink", (uint32_t)-1);
-                if (target_sink != (uint32_t)-1 && sink_nodes.count(target_sink)) {
-                    m_Links.emplace_back(Link(GetNextId(), n->Outputs[0].ID, sink_nodes[target_sink]->Inputs[0].ID));
-                    m_Links.back().Color = GetIconColor(PinType::SinkInput);
-                }
+                uint32_t target_sink = si.value("sink", static_cast<uint32_t>(-1));
+                if (hidden_sink_ids.count(target_sink))
+                    playbackOnBus.emplace_back(id, target_sink);
+                else if (target_sink != static_cast<uint32_t>(-1) && sink_nodes.count(target_sink))
+                    AddGraphLink(&n->Outputs[0],
+                                 &sink_nodes[target_sink]->Inputs[0], RouteType::PlaybackToSink);
             }
 
             y = 0;
-            for (auto& so : source_outputs) {
-                uint32_t id = so.value("index", 0);
+            for (auto& so : source_outputs)
+            {
+                uint32_t id = so.value("index", 0u);
                 std::string name = so.value("name", "Unknown Source-Output");
-                if (so.contains("properties")) {
-                    if (so["properties"].contains("application.name")) {
+                if (so.contains("properties"))
+                {
+                    if (so["properties"].contains("application.name"))
                         name = so["properties"]["application.name"];
-                    }
-                    if (so["properties"].contains("media.name")) {
+                    if (so["properties"].contains("media.name"))
+                    {
                         std::string media = so["properties"]["media.name"];
                         if (media.length() > 25) media = media.substr(0, 22) + "...";
                         name += " - " + media;
                     }
                 }
-                m_AvailableSourceOutputs.push_back({id, name, ""});
+
+                std::string pa_name = so.value("name", name);
+                m_AvailableSourceOutputs.push_back({id, name, pa_name});
                 Node* n = SpawnSourceOutputNode(id, name.c_str());
+                n->PA_Name = pa_name;
                 n->Details = ParseDetails(so);
                 ed::SetNodePosition(n->ID, ImVec2(-250, y));
+                source_output_nodes[id] = n;
                 y += 150;
 
-                uint32_t target_source = so.value("source", (uint32_t)-1);
-                if (target_source != (uint32_t)-1 && source_nodes.count(target_source)) {
-                    m_Links.emplace_back(Link(GetNextId(), source_nodes[target_source]->Outputs[0].ID, n->Inputs[0].ID));
-                    m_Links.back().Color = GetIconColor(PinType::Source);
-                }
+                uint32_t target_source = so.value("source", static_cast<uint32_t>(-1));
+                if (hidden_source_ids.count(target_source))
+                    captureOnBus.emplace_back(id, target_source);
+                else if (target_source != static_cast<uint32_t>(-1) && source_nodes.count(target_source))
+                    AddGraphLink(&source_nodes[target_source]->Outputs[0], &n->Inputs[0], RouteType::SourceToCapture);
             }
 
-            // Auto-link monitor sources to their parent sinks
-            for (auto& s : sources) {
-                if (s.contains("monitor_source") || s.value("name", "").find(".monitor") != std::string::npos) {
-                    // Find if this source monitors a sink
-                    uint32_t source_id = s.value("index", 0);
-                    std::string source_pa_name = s.value("name", "");
+            // Reconstruct Source -> Sink logical links from real module-loopback
+            // instances. The module itself remains an implementation detail.
+            const auto modules = GetPulseModules();
+            for (const auto& module : modules)
+            {
+                if (module.Name != "module-loopback")
+                    continue;
 
-                    // Check monitor_of_sink field if available, otherwise match by name
-                    for (auto& sk : sinks) {
-                        std::string sink_monitor = sk.value("monitor_source", "");
-                        if (!sink_monitor.empty() && sink_monitor == source_pa_name) {
-                            uint32_t sink_id = sk.value("index", 0);
-                            if (source_nodes.count(source_id) && sink_nodes.count(sink_id)) {
-                                m_Links.emplace_back(Link(GetNextId(), source_nodes[source_id]->Outputs[0].ID, sink_nodes[sink_id]->Inputs[0].ID));
-                                m_Links.back().Color = GetIconColor(PinType::Source);
-                            }
+                const std::string sourceName = ModuleArgument(module.Args, "source");
+                const std::string sinkName = ModuleArgument(module.Args, "sink");
+                auto sourceIt = source_name_nodes.find(sourceName);
+                auto sinkIt = sink_name_nodes.find(sinkName);
+                if (sourceIt != source_name_nodes.end() && sinkIt != sink_name_nodes.end())
+                    AddGraphLink(&sourceIt->second->Outputs[0], &sinkIt->second->Inputs[0],
+                                 RouteType::SourceToSink, true, module.ID);
+            }
+
+            // Reconstruct Playback -> Capture logical links. A Soundmapper bus
+            // is shared by all playback streams feeding the same capture app.
+            for (const auto& playback : playbackOnBus)
+            {
+                auto inputIt = sink_input_nodes.find(playback.first);
+                if (inputIt == sink_input_nodes.end())
+                    continue;
+
+                for (const auto& capture : captureOnBus)
+                {
+                    // Both endpoints must use the same hidden bus monitor/source.
+                    std::string busName;
+                    for (const auto& pair : bus_sink_ids)
+                    {
+                        if (pair.second == playback.second)
+                        {
+                            busName = pair.first;
                             break;
                         }
                     }
+                    if (busName.empty())
+                        continue;
+
+                    auto monitorIt = bus_monitor_ids.find(busName);
+                    if (monitorIt == bus_monitor_ids.end() || monitorIt->second != capture.second)
+                        continue;
+
+                    auto outputIt = source_output_nodes.find(capture.first);
+                    if (outputIt == source_output_nodes.end())
+                        continue;
+
+                    // Find the module-null-sink that owns this bus so the logical
+                    // link can still be deleted/managed after a refresh.
+                    uint32_t busModuleID = 0;
+                    for (const auto& module : modules)
+                    {
+                        if (module.Name != "module-null-sink")
+                            continue;
+                        const std::string sinkName = ModuleArgument(module.Args, "sink_name");
+                        if (sinkName == busName)
+                        {
+                            busModuleID = module.ID;
+                            break;
+                        }
+                    }
+
+                    Link* logicalLink = AddGraphLink(&inputIt->second->Outputs[0], &outputIt->second->Inputs[0],
+                                                      RouteType::PlaybackToCapture, busModuleID != 0, busModuleID, busName);
+                    if (logicalLink && busModuleID != 0)
+                    {
+                        // Older state may have been created before Soundmapper
+                        // recorded the previous endpoints. Use current defaults
+                        // as a safe fallback so deleting a refreshed logical
+                        // route does not strand a stream on the hidden bus.
+                        logicalLink->PreviousSinkID = GetDefaultSinkID();
+                        logicalLink->PreviousSourceID = GetDefaultSourceID();
+                    }
                 }
             }
-
-        } catch (...) {
+        }
+        catch (...) {
             printf("Failed to parse PulseAudio JSON\n");
+            LogMessage("refresh failed: PulseAudio JSON parse error");
         }
 
         BuildNodes();
@@ -493,6 +1372,8 @@ struct Example:
 
     void OnStart() override
     {
+        std::ofstream(kLogPath, std::ios::trunc) << "Soundmapper log started\n";
+        LogMessage("application started");
         ed::Config config;
 
         config.SettingsFile = "/home/friday/.data/soundmapper/build/bin/Blueprints.json";
@@ -827,6 +1708,7 @@ struct Example:
                             }
                             else if (!CanCreateLink(startPin, endPin))
                             {
+                                LogMessage("link rejected: incompatible endpoints from=" + DescribePin(startPin) + " to=" + DescribePin(endPin));
                                 showLabel("x Incompatible Pin Type", ImColor(45, 32, 32, 180));
                                 ed::RejectNewItem(ImColor(255, 128, 128), 1.0f);
                             }
@@ -835,57 +1717,38 @@ struct Example:
                                 showLabel("+ Create Link", ImColor(32, 45, 32, 180));
                                 if (ed::AcceptNewItem(ImColor(128, 255, 128), 4.0f))
                                 {
-                                    // Enforce single-link on pins that need it
-                                    if (startPin->Type == PinType::SourceOutput || startPin->Type == PinType::SinkInput)
+                                    LogMessage("link accepted by UI from=" + DescribePin(startPin) + " to=" + DescribePin(endPin));
+                                    // SinkInput has exactly one playback destination.
+                                    // SourceOutput has exactly one capture source, but multiple
+                                    // logical Playback->Capture links can share the same bus.
+                                    if (startPin->Type == PinType::SinkInput)
+                                        RemoveLinksUsingPin(startPinId);
+                                    if (endPin->Type == PinType::SinkInput)
+                                        RemoveLinksUsingPin(endPinId);
+
+                                    // A SourceOutput can consume only one Source.
+                                    // Multiple Playback->Capture routes are the
+                                    // exception: they intentionally share one bus.
+                                    if (startPin->Type == PinType::SourceOutput || endPin->Type == PinType::SourceOutput)
                                     {
-                                        m_Links.erase(std::remove_if(m_Links.begin(), m_Links.end(),
-                                            [startPinId](const Link& l) { return l.StartPinID == startPinId || l.EndPinID == startPinId; }), m_Links.end());
+                                        Pin* so = startPin->Type == PinType::SourceOutput ? startPin : endPin;
+                                        RouteType newType = GetRouteType(startPin, endPin);
+                                        if (newType != RouteType::PlaybackToCapture)
+                                            RemoveLinksUsingPin(so->ID);
                                     }
-                                    if (endPin->Type == PinType::SourceOutput || endPin->Type == PinType::SinkInput)
+
+                                    Link candidate(GetNextId(), startPinId, endPinId);
+                                    candidate.Color = GetIconColor(startPin->Type);
+
+                                    if (ApplyRoute(startPin, endPin, candidate))
                                     {
-                                        m_Links.erase(std::remove_if(m_Links.begin(), m_Links.end(),
-                                            [endPinId](const Link& l) { return l.StartPinID == endPinId || l.EndPinID == endPinId; }), m_Links.end());
+                                        m_Links.emplace_back(std::move(candidate));
+                                        LogMessage("link added to graph");
                                     }
-
-                                    m_Links.emplace_back(Link(GetNextId(), startPinId, endPinId));
-                                    m_Links.back().Color = GetIconColor(startPin->Type);
-
-                                    // Run pactl command for sink-input -> sink
-                                    if (startPin->Type == PinType::SinkInput || endPin->Type == PinType::SinkInput) {
-                                        Pin* sinkInputPin = startPin->Type == PinType::SinkInput ? startPin : endPin;
-                                        Pin* sinkPin = startPin->Type == PinType::Sink ? startPin : endPin;
-                                        if (sinkInputPin && sinkPin) {
-                                            char cmd[256];
-                                            snprintf(cmd, sizeof(cmd), "pactl move-sink-input %u %u", sinkInputPin->Node->PA_ID, sinkPin->Node->PA_ID);
-                                            ExecCommand(cmd);
-                                        }
-                                    }
-
-                                    // Run pactl command for source-output -> source
-                                    if (startPin->Type == PinType::SourceOutput || endPin->Type == PinType::SourceOutput) {
-                                        Pin* sourceOutputPin = startPin->Type == PinType::SourceOutput ? startPin : endPin;
-                                        Pin* sourcePin = startPin->Type == PinType::Source ? startPin : endPin;
-                                        if (sourceOutputPin && sourcePin) {
-                                            char cmd[256];
-                                            snprintf(cmd, sizeof(cmd), "pactl move-source-output %u %u", sourceOutputPin->Node->PA_ID, sourcePin->Node->PA_ID);
-                                            ExecCommand(cmd);
-                                        }
-                                    }
-
-                                    // Run pactl command for source -> sink (loopback module)
-                                    if ((startPin->Type == PinType::Source && endPin->Type == PinType::Sink) ||
-                                        (startPin->Type == PinType::Sink && endPin->Type == PinType::Source)) {
-                                        Pin* sourcePin = startPin->Type == PinType::Source ? startPin : endPin;
-                                        Pin* sinkPin = startPin->Type == PinType::Sink ? startPin : endPin;
-                                        if (sourcePin && sinkPin) {
-                                            char cmd[512];
-                                            snprintf(cmd, sizeof(cmd), "pactl load-module module-loopback source=%s sink=%s",
-                                                sourcePin->Node->PA_Name.c_str(), sinkPin->Node->PA_Name.c_str());
-                                            std::string output = ExecCommand(cmd);
-                                            try {
-                                                m_Links.back().PA_Module_ID = std::stoul(output);
-                                            } catch (...) {}
-                                        }
+                                    else
+                                    {
+                                        LogMessage("link not added: route application failed");
+                                        showLabel("x Route failed / verification failed", ImColor(70, 32, 32, 220));
                                     }
                                 }
                             }
@@ -936,11 +1799,11 @@ struct Example:
                             auto id = std::find_if(m_Links.begin(), m_Links.end(), [linkId](auto& link) { return link.ID == linkId; });
                             if (id != m_Links.end())
                             {
-                                if (id->PA_Module_ID > 0)
+                                if (id->Managed)
                                 {
-                                    char cmd[256];
-                                    snprintf(cmd, sizeof(cmd), "pactl unload-module %u", id->PA_Module_ID);
-                                    ExecCommand(cmd);
+                                    LogMessage("link deleted: restoring managed route");
+                                    RestoreRouteEndpoints(*id);
+                                    RemoveRouteResources(*id);
                                 }
                                 m_Links.erase(id);
                             }
@@ -1067,8 +1930,10 @@ struct Example:
                             if (startPin->Kind == PinKind::Input)
                                 std::swap(startPin, endPin);
 
-                            m_Links.emplace_back(Link(GetNextId(), startPin->ID, endPin->ID));
-                            m_Links.back().Color = GetIconColor(startPin->Type);
+                            Link candidate(GetNextId(), startPin->ID, endPin->ID);
+                            candidate.Color = GetIconColor(startPin->Type);
+                            if (ApplyRoute(startPin, endPin, candidate))
+                                m_Links.emplace_back(std::move(candidate));
 
                             break;
                         }

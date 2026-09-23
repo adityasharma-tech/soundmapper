@@ -1,5 +1,6 @@
 add_example_executable(soundmapper
     soundmapper.cpp
+    routing_engine.h
     utilities/builders.h
     utilities/drawing.h
     utilities/widgets.h
