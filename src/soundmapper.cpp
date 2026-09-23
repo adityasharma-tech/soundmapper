@@ -38,6 +38,7 @@ std::string ExecCommand(const char* cmd) {
 #include <chrono>
 #include <iomanip>
 #include <ctime>
+#include <cctype>
 #include <sys/wait.h>
 
 
@@ -399,19 +400,40 @@ struct Example:
         return ExecPactl("pactl unload-module " + std::to_string(moduleID), output);
     }
 
-    void CreateNullSink()
+    static std::string NormalizeNullSinkName(const std::string& requestedName)
     {
-        const std::string sinkName = "soundmapper_null_" + std::to_string(m_NextId);
+        std::string result;
+        for (unsigned char character : requestedName)
+        {
+            if (std::isalnum(character) || character == '_' || character == '-')
+                result += static_cast<char>(character);
+            else if (!result.empty() && result.back() != '_')
+                result += '_';
+        }
+        while (!result.empty() && result.back() == '_')
+            result.pop_back();
+        return result;
+    }
+
+    bool CreateNullSink(const std::string& requestedName)
+    {
+        const std::string name = NormalizeNullSinkName(requestedName);
+        if (name.empty())
+            return false;
+
+        const std::string sinkName = "soundmapper_" + name;
+        if (FindSinkByName(sinkName))
+            return false;
+
         uint32_t moduleID = 0;
-        if (PactlCreateNullSink(sinkName, "Soundmapper Null Sink", moduleID))
+        if (PactlCreateNullSink(sinkName, name, moduleID))
         {
             LogMessage("null sink created name=" + sinkName + " module=" + std::to_string(moduleID));
             m_WantsRefresh = true;
+            return true;
         }
-        else
-        {
-            LogMessage("null sink creation failed name=" + sinkName);
-        }
+        LogMessage("null sink creation failed name=" + sinkName);
+        return false;
     }
 
     bool FindSinkByName(const std::string& name, uint32_t* id = nullptr)
@@ -1518,8 +1540,38 @@ struct Example:
             ExecCommand("pactl load-module module-loopback");
             m_WantsRefresh = true;
         }
+        static char nullSinkName[128] = "";
+        static bool focusNullSinkName = false;
+        static std::string nullSinkError;
         if (ImGui::Button("Create Null Sink", ImVec2(paneWidth - 20, 30))) {
-            CreateNullSink();
+            nullSinkName[0] = '\0';
+            nullSinkError.clear();
+            focusNullSinkName = true;
+            ImGui::OpenPopup("Name New Null Sink");
+        }
+        if (ImGui::BeginPopupModal("Name New Null Sink", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::TextUnformatted("Null sink name");
+            if (focusNullSinkName)
+            {
+                ImGui::SetKeyboardFocusHere();
+                focusNullSinkName = false;
+            }
+            ImGui::InputText("##null_sink_name", nullSinkName, sizeof(nullSinkName));
+            if (!nullSinkError.empty())
+                ImGui::TextColored(ImColor(255, 128, 128), "%s", nullSinkError.c_str());
+
+            if (ImGui::Button("Create", ImVec2(120, 0)))
+            {
+                if (CreateNullSink(nullSinkName))
+                    ImGui::CloseCurrentPopup();
+                else
+                    nullSinkError = "Enter a unique name using letters, numbers, _ or -.";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0)))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
         }
         ImGui::EndChild();
     }
@@ -1867,8 +1919,6 @@ struct Example:
                 node = SpawnSinkNode();
             if (ImGui::MenuItem("Source"))
                 node = SpawnSourceNode();
-            if (ImGui::MenuItem("Null Sink"))
-                CreateNullSink();
 
             if (node)
             {
