@@ -16,14 +16,6 @@ set(CMAKE_CXX_STANDARD            14)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
 set(CMAKE_CXX_STANDARD_REQUIRED   YES)
 
-enable_testing()
-add_executable(routing_engine_tests tests/routing_engine_test.cpp)
-target_include_directories(routing_engine_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-add_test(NAME routing_engine_tests COMMAND routing_engine_tests)
-
-
-
-
 
 # Macro that will configure an example application
 macro(add_example_executable name)

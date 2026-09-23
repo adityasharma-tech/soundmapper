@@ -105,10 +105,15 @@ struct Node
     int DemoOption;
     uint32_t PA_ID;
     std::string PA_Name;
+    uint32_t PA_Monitor_ID;
+    std::string PA_Monitor_Name;
+    uint32_t PA_Module_ID;
+    bool IsNullSink;
     std::string Details;
 
     Node(int id, const char* name, uint32_t pa_id = 0, ImColor color = ImColor(255, 255, 255)):
-        ID(id), Name(name), Color(color), Type(NodeType::Blueprint), Size(0, 0), DemoOption(0), PA_ID(pa_id)
+        ID(id), Name(name), Color(color), Type(NodeType::Blueprint), Size(0, 0), DemoOption(0), PA_ID(pa_id),
+        PA_Monitor_ID(static_cast<uint32_t>(-1)), PA_Module_ID(0), IsNullSink(false)
     {
     }
 };
@@ -301,6 +306,16 @@ struct Example:
         return pin->Node->Name + " (id=" + std::to_string(pin->Node->PA_ID) + ")";
     }
 
+    static uint32_t SourceEndpointID(const Pin* pin)
+    {
+        return pin->Node->IsNullSink ? pin->Node->PA_Monitor_ID : pin->Node->PA_ID;
+    }
+
+    static const std::string& SourceEndpointName(const Pin* pin)
+    {
+        return pin->Node->IsNullSink ? pin->Node->PA_Monitor_Name : pin->Node->PA_Name;
+    }
+
     static std::string ShellQuote(const std::string& value)
     {
         std::string out = "'";
@@ -382,6 +397,21 @@ struct Example:
             return true;
         std::string output;
         return ExecPactl("pactl unload-module " + std::to_string(moduleID), output);
+    }
+
+    void CreateNullSink()
+    {
+        const std::string sinkName = "soundmapper_null_" + std::to_string(m_NextId);
+        uint32_t moduleID = 0;
+        if (PactlCreateNullSink(sinkName, "Soundmapper Null Sink", moduleID))
+        {
+            LogMessage("null sink created name=" + sinkName + " module=" + std::to_string(moduleID));
+            m_WantsRefresh = true;
+        }
+        else
+        {
+            LogMessage("null sink creation failed name=" + sinkName);
+        }
     }
 
     bool FindSinkByName(const std::string& name, uint32_t* id = nullptr)
@@ -611,9 +641,9 @@ struct Example:
         {
             if (!GetCurrentSourceForSourceOutput(sourceOutput->Node->PA_ID, link.PreviousSourceID))
                 return fail("cannot read current source-output source");
-            if (!PactlMoveSourceOutput(sourceOutput->Node->PA_ID, source->Node->PA_ID))
+            if (!PactlMoveSourceOutput(sourceOutput->Node->PA_ID, SourceEndpointID(source)))
                 return fail("move-source-output command failed");
-            if (!VerifySourceOutput(sourceOutput->Node->PA_ID, source->Node->PA_ID))
+            if (!VerifySourceOutput(sourceOutput->Node->PA_ID, SourceEndpointID(source)))
                 return fail("source-output source verification failed");
             link.Managed = true;
             LogMessage("route applied type=source-to-capture");
@@ -623,10 +653,10 @@ struct Example:
         if (link.Type == RouteType::SourceToSink)
         {
             uint32_t moduleID = 0;
-            if (!PactlCreateLoopback(source->Node->PA_Name, sink->Node->PA_Name, moduleID))
+            if (!PactlCreateLoopback(SourceEndpointName(source), sink->Node->PA_Name, moduleID))
                 return fail("loopback module creation failed");
 
-            if (!VerifyLoopback(moduleID, source->Node->PA_Name, sink->Node->PA_Name))
+            if (!VerifyLoopback(moduleID, SourceEndpointName(source), sink->Node->PA_Name))
             {
                 PactlUnloadModule(moduleID);
                 return fail("loopback module verification failed");
@@ -915,11 +945,12 @@ struct Example:
         return &m_Nodes.back();
     }
 
-    Node* SpawnLoopbackNode(uint32_t pa_id = 0, const char* name = "Loopback")
+    Node* SpawnNullSinkNode(uint32_t pa_id = 0, const char* name = "Null Sink")
     {
         m_Nodes.emplace_back(GetNextId(), name, pa_id, ImColor(255, 128, 255));
-        m_Nodes.back().Inputs.emplace_back(GetNextId(), "", PinType::Sink);
-        m_Nodes.back().Outputs.emplace_back(GetNextId(), "", PinType::Source);
+        m_Nodes.back().IsNullSink = true;
+        m_Nodes.back().Inputs.emplace_back(GetNextId(), "Input", PinType::Sink);
+        m_Nodes.back().Outputs.emplace_back(GetNextId(), "Output", PinType::Source);
         BuildNode(&m_Nodes.back());
         return &m_Nodes.back();
     }
@@ -961,20 +992,6 @@ struct Example:
             }
         }
         return details;
-    }
-
-    static bool IsSoundmapperBusName(const std::string& name)
-    {
-        return name.rfind("soundmapper_bus_", 0) == 0;
-    }
-
-    static bool IsSoundmapperInternalSource(const std::string& name)
-    {
-        // Every Soundmapper bus exposes a monitor source.  These are
-        // implementation details and must not become user-visible graph nodes.
-        return name.rfind("soundmapper_bus_", 0) == 0 &&
-               name.size() >= std::string("soundmapper_bus_").size() + 8 &&
-               name.find(".monitor") != std::string::npos;
     }
 
     static bool IsMonitorSource(const json& source)
@@ -1096,17 +1113,16 @@ struct Example:
                 }
                 catch (...) {}
             }
-            else if (have && line.rfind("Name:", 0) == 0)
+            else if (have)
             {
-                current.Name = line.substr(5);
-                while (!current.Name.empty() && current.Name.front() == ' ')
-                    current.Name.erase(current.Name.begin());
-            }
-            else if (have && line.rfind("Argument:", 0) == 0)
-            {
-                current.Args = line.substr(9);
-                while (!current.Args.empty() && current.Args.front() == ' ')
-                    current.Args.erase(current.Args.begin());
+                const size_t first = line.find_first_not_of(" \t");
+                if (first == std::string::npos)
+                    continue;
+                const std::string field = line.substr(first);
+                if (field.rfind("Name:", 0) == 0)
+                    current.Name = field.substr(5);
+                else if (field.rfind("Argument:", 0) == 0)
+                    current.Args = field.substr(9);
             }
         }
         flush();
@@ -1147,10 +1163,14 @@ struct Example:
             std::map<uint32_t, Node*> source_nodes;
             std::map<std::string, Node*> sink_name_nodes;
             std::map<std::string, Node*> source_name_nodes;
-            std::set<uint32_t> hidden_sink_ids;
-            std::set<uint32_t> hidden_source_ids;
-            std::map<std::string, uint32_t> bus_sink_ids;
-            std::map<std::string, uint32_t> bus_monitor_ids;
+            std::map<std::string, Node*> null_sink_monitor_nodes;
+            const auto modules = GetPulseModules();
+            std::map<std::string, uint32_t> null_sink_modules;
+            for (const auto& module : modules)
+            {
+                if (module.Name == "module-null-sink")
+                    null_sink_modules[ModuleArgument(module.Args, "sink_name")] = module.ID;
+            }
 
             float y = 0;
             for (auto& s : sinks)
@@ -1159,10 +1179,22 @@ struct Example:
                 std::string pa_name = s.value("name", "");
                 std::string desc = s.value("description", pa_name.empty() ? "Unknown Sink" : pa_name);
 
-                if (IsSoundmapperBusName(pa_name))
+                auto nullSinkModule = null_sink_modules.find(pa_name);
+                const bool isNullSink = s.value("driver", "") == "module-null-sink.c";
+                if (isNullSink)
                 {
-                    hidden_sink_ids.insert(id);
-                    bus_sink_ids[pa_name] = id;
+                    Node* n = SpawnNullSinkNode(id, desc.c_str());
+                    n->PA_Name = pa_name;
+                    n->PA_Monitor_Name = s.value("monitor_source", pa_name + ".monitor");
+                    n->PA_Module_ID = nullSinkModule != null_sink_modules.end()
+                        ? nullSinkModule->second
+                        : s.value("owner_module", 0u);
+                    n->Details = ParseDetails(s);
+                    ed::SetNodePosition(n->ID, ImVec2(100, y));
+                    sink_nodes[id] = n;
+                    sink_name_nodes[pa_name] = n;
+                    null_sink_monitor_nodes[n->PA_Monitor_Name] = n;
+                    y += 150;
                     continue;
                 }
 
@@ -1183,17 +1215,15 @@ struct Example:
                 std::string pa_name = s.value("name", "");
                 std::string desc = s.value("description", pa_name.empty() ? "Unknown Source" : pa_name);
 
-                if (IsSoundmapperInternalSource(pa_name))
+                auto nullSinkNode = null_sink_monitor_nodes.find(pa_name);
+                if (nullSinkNode != null_sink_monitor_nodes.end())
                 {
-                    hidden_source_ids.insert(id);
-                    // Associate monitor source with the corresponding hidden bus.
-                    std::string busName = pa_name.substr(0, pa_name.find(".monitor"));
-                    bus_monitor_ids[busName] = id;
+                    nullSinkNode->second->PA_Monitor_ID = id;
+                    source_nodes[id] = nullSinkNode->second;
+                    source_name_nodes[pa_name] = nullSinkNode->second;
                     continue;
                 }
 
-                // Hardware/output monitor sources are not useful routing
-                // choices in this simplified graph, so never expose them.
                 if (IsMonitorSource(s))
                     continue;
 
@@ -1209,9 +1239,6 @@ struct Example:
 
             std::map<uint32_t, Node*> sink_input_nodes;
             std::map<uint32_t, Node*> source_output_nodes;
-            std::vector<std::pair<uint32_t, uint32_t>> playbackOnBus;
-            std::vector<std::pair<uint32_t, uint32_t>> captureOnBus;
-
             y = 0;
             for (auto& si : sink_inputs)
             {
@@ -1239,9 +1266,7 @@ struct Example:
                 y += 150;
 
                 uint32_t target_sink = si.value("sink", static_cast<uint32_t>(-1));
-                if (hidden_sink_ids.count(target_sink))
-                    playbackOnBus.emplace_back(id, target_sink);
-                else if (target_sink != static_cast<uint32_t>(-1) && sink_nodes.count(target_sink))
+                if (target_sink != static_cast<uint32_t>(-1) && sink_nodes.count(target_sink))
                     AddGraphLink(&n->Outputs[0],
                                  &sink_nodes[target_sink]->Inputs[0], RouteType::PlaybackToSink);
             }
@@ -1273,15 +1298,10 @@ struct Example:
                 y += 150;
 
                 uint32_t target_source = so.value("source", static_cast<uint32_t>(-1));
-                if (hidden_source_ids.count(target_source))
-                    captureOnBus.emplace_back(id, target_source);
-                else if (target_source != static_cast<uint32_t>(-1) && source_nodes.count(target_source))
+                if (target_source != static_cast<uint32_t>(-1) && source_nodes.count(target_source))
                     AddGraphLink(&source_nodes[target_source]->Outputs[0], &n->Inputs[0], RouteType::SourceToCapture);
             }
 
-            // Reconstruct Source -> Sink logical links from real module-loopback
-            // instances. The module itself remains an implementation detail.
-            const auto modules = GetPulseModules();
             for (const auto& module : modules)
             {
                 if (module.Name != "module-loopback")
@@ -1296,65 +1316,6 @@ struct Example:
                                  RouteType::SourceToSink, true, module.ID);
             }
 
-            // Reconstruct Playback -> Capture logical links. A Soundmapper bus
-            // is shared by all playback streams feeding the same capture app.
-            for (const auto& playback : playbackOnBus)
-            {
-                auto inputIt = sink_input_nodes.find(playback.first);
-                if (inputIt == sink_input_nodes.end())
-                    continue;
-
-                for (const auto& capture : captureOnBus)
-                {
-                    // Both endpoints must use the same hidden bus monitor/source.
-                    std::string busName;
-                    for (const auto& pair : bus_sink_ids)
-                    {
-                        if (pair.second == playback.second)
-                        {
-                            busName = pair.first;
-                            break;
-                        }
-                    }
-                    if (busName.empty())
-                        continue;
-
-                    auto monitorIt = bus_monitor_ids.find(busName);
-                    if (monitorIt == bus_monitor_ids.end() || monitorIt->second != capture.second)
-                        continue;
-
-                    auto outputIt = source_output_nodes.find(capture.first);
-                    if (outputIt == source_output_nodes.end())
-                        continue;
-
-                    // Find the module-null-sink that owns this bus so the logical
-                    // link can still be deleted/managed after a refresh.
-                    uint32_t busModuleID = 0;
-                    for (const auto& module : modules)
-                    {
-                        if (module.Name != "module-null-sink")
-                            continue;
-                        const std::string sinkName = ModuleArgument(module.Args, "sink_name");
-                        if (sinkName == busName)
-                        {
-                            busModuleID = module.ID;
-                            break;
-                        }
-                    }
-
-                    Link* logicalLink = AddGraphLink(&inputIt->second->Outputs[0], &outputIt->second->Inputs[0],
-                                                      RouteType::PlaybackToCapture, busModuleID != 0, busModuleID, busName);
-                    if (logicalLink && busModuleID != 0)
-                    {
-                        // Older state may have been created before Soundmapper
-                        // recorded the previous endpoints. Use current defaults
-                        // as a safe fallback so deleting a refreshed logical
-                        // route does not strand a stream on the hidden bus.
-                        logicalLink->PreviousSinkID = GetDefaultSinkID();
-                        logicalLink->PreviousSourceID = GetDefaultSourceID();
-                    }
-                }
-            }
         }
         catch (...) {
             printf("Failed to parse PulseAudio JSON\n");
@@ -1499,7 +1460,7 @@ struct Example:
                 } else if (node->Inputs.size() && node->Inputs[0].Type == PinType::SourceOutput) {
                     entities = &m_AvailableSourceOutputs;
                     is_source_output = true;
-                } else if (node->Inputs.size() && node->Inputs[0].Type == PinType::Sink) {
+                } else if (!node->IsNullSink && node->Inputs.size() && node->Inputs[0].Type == PinType::Sink) {
                     entities = &m_AvailableSinks;
                 } else if (node->Outputs.size() && node->Outputs[0].Type == PinType::Source) {
                     entities = &m_AvailableSources;
@@ -1558,8 +1519,7 @@ struct Example:
             m_WantsRefresh = true;
         }
         if (ImGui::Button("Create Null Sink", ImVec2(paneWidth - 20, 30))) {
-            ExecCommand("pactl load-module module-null-sink");
-            m_WantsRefresh = true;
+            CreateNullSink();
         }
         ImGui::EndChild();
     }
@@ -1907,8 +1867,8 @@ struct Example:
                 node = SpawnSinkNode();
             if (ImGui::MenuItem("Source"))
                 node = SpawnSourceNode();
-            if (ImGui::MenuItem("Loopback"))
-                node = SpawnLoopbackNode();
+            if (ImGui::MenuItem("Null Sink"))
+                CreateNullSink();
 
             if (node)
             {
