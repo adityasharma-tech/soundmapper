@@ -1157,6 +1157,30 @@ struct Example:
         // state. Internal Soundmapper buses/monitors are deliberately hidden;
         // the user sees SinkInput -> SourceOutput instead of the null-sink
         // implementation used underneath.
+        // --- Snapshot current node positions BEFORE clearing ---
+        // Node IDs are recreated from scratch on every refresh (m_Nodes.clear()),
+        // so the editor's per-NodeId saved state is thrown away each time.
+        // We persist positions ourselves, keyed by "type:pa_id", so nodes
+        // that the user moved keep their position across refreshes.
+        m_SavedPositions.clear();
+        for (const auto& node : m_Nodes)
+        {
+            if (node.PA_ID == 0) continue;
+            std::string key;
+            if (node.IsNullSink)
+                key = "nullsink:" + std::to_string(node.PA_ID);
+            else if (!node.Inputs.empty()  && node.Inputs[0].Type  == PinType::Sink)
+                key = "sink:"      + std::to_string(node.PA_ID);
+            else if (!node.Outputs.empty() && node.Outputs[0].Type == PinType::Source)
+                key = "source:"    + std::to_string(node.PA_ID);
+            else if (!node.Outputs.empty() && node.Outputs[0].Type == PinType::SinkInput)
+                key = "sinkinput:" + std::to_string(node.PA_ID);
+            else if (!node.Inputs.empty()  && node.Inputs[0].Type  == PinType::SourceOutput)
+                key = "srcoutput:" + std::to_string(node.PA_ID);
+            if (!key.empty())
+                m_SavedPositions[key] = ed::GetNodePosition(node.ID);
+        }
+
         m_Nodes.clear();
         m_Nodes.reserve(1000);
         m_Links.clear();
@@ -1194,7 +1218,42 @@ struct Example:
                     null_sink_modules[ModuleArgument(module.Args, "sink_name")] = module.ID;
             }
 
-            float y = 0;
+            // ---------------------------------------------------------------
+            // Layout: independent y-cursor per column so nodes in different
+            // columns can never share the same row and overlap.
+            //
+            // Signal flow (left -> right):
+            //  Source(-900) -> SinkInput(-450) -> NullSink(+50) -> Sink(+550)
+            //                               \-> SourceOutput(-200)
+            //
+            // 500 px column gap is wide enough for typical node label lengths.
+            // ---------------------------------------------------------------
+            const float kColSource    = -900.0f;
+            const float kColSinkInput = -450.0f;
+            const float kColSrcOutput = -200.0f;
+            const float kColNullSink  =   50.0f;
+            const float kColSink      =  550.0f;
+            const float kRowStep      =  160.0f;
+
+            float ySource    = 0.0f;
+            float yNullSink  = 0.0f;
+            float ySink      = 0.0f;
+            float ySinkInput = 0.0f;
+            float ySrcOutput = 0.0f;
+
+            // placeNode: ALWAYS sets position (node IDs are brand-new every refresh).
+            // If this PA entity appeared in the last refresh, restore the position
+            // the user dragged it to. Otherwise use the clean grid default.
+            auto placeNode = [&](Node* n, const std::string& key, float x, float& y)
+            {
+                auto it = m_SavedPositions.find(key);
+                if (it != m_SavedPositions.end())
+                    ed::SetNodePosition(n->ID, it->second);
+                else
+                    ed::SetNodePosition(n->ID, ImVec2(x, y));
+                y += kRowStep;
+            };
+
             for (auto& s : sinks)
             {
                 uint32_t id = s.value("index", 0u);
@@ -1212,11 +1271,10 @@ struct Example:
                         ? nullSinkModule->second
                         : s.value("owner_module", 0u);
                     n->Details = ParseDetails(s);
-                    ed::SetNodePosition(n->ID, ImVec2(100, y));
+                    placeNode(n, "nullsink:" + std::to_string(id), kColNullSink, yNullSink);
                     sink_nodes[id] = n;
                     sink_name_nodes[pa_name] = n;
                     null_sink_monitor_nodes[n->PA_Monitor_Name] = n;
-                    y += 150;
                     continue;
                 }
 
@@ -1224,13 +1282,11 @@ struct Example:
                 Node* n = SpawnSinkNode(id, desc.c_str());
                 n->PA_Name = pa_name;
                 n->Details = ParseDetails(s);
-                ed::SetNodePosition(n->ID, ImVec2(500, y));
+                placeNode(n, "sink:" + std::to_string(id), kColSink, ySink);
                 sink_nodes[id] = n;
                 sink_name_nodes[pa_name] = n;
-                y += 150;
             }
 
-            y = 0;
             for (auto& s : sources)
             {
                 uint32_t id = s.value("index", 0u);
@@ -1253,15 +1309,13 @@ struct Example:
                 Node* n = SpawnSourceNode(id, desc.c_str());
                 n->PA_Name = pa_name;
                 n->Details = ParseDetails(s);
-                ed::SetNodePosition(n->ID, ImVec2(-500, y));
+                placeNode(n, "source:" + std::to_string(id), kColSource, ySource);
                 source_nodes[id] = n;
                 source_name_nodes[pa_name] = n;
-                y += 150;
             }
 
             std::map<uint32_t, Node*> sink_input_nodes;
             std::map<uint32_t, Node*> source_output_nodes;
-            y = 0;
             for (auto& si : sink_inputs)
             {
                 uint32_t id = si.value("index", 0u);
@@ -1283,9 +1337,8 @@ struct Example:
                 Node* n = SpawnSinkInputNode(id, name.c_str());
                 n->PA_Name = pa_name;
                 n->Details = ParseDetails(si);
-                ed::SetNodePosition(n->ID, ImVec2(0, y));
+                placeNode(n, "sinkinput:" + std::to_string(id), kColSinkInput, ySinkInput);
                 sink_input_nodes[id] = n;
-                y += 150;
 
                 uint32_t target_sink = si.value("sink", static_cast<uint32_t>(-1));
                 if (target_sink != static_cast<uint32_t>(-1) && sink_nodes.count(target_sink))
@@ -1293,7 +1346,6 @@ struct Example:
                                  &sink_nodes[target_sink]->Inputs[0], RouteType::PlaybackToSink);
             }
 
-            y = 0;
             for (auto& so : source_outputs)
             {
                 uint32_t id = so.value("index", 0u);
@@ -1315,9 +1367,8 @@ struct Example:
                 Node* n = SpawnSourceOutputNode(id, name.c_str());
                 n->PA_Name = pa_name;
                 n->Details = ParseDetails(so);
-                ed::SetNodePosition(n->ID, ImVec2(-250, y));
+                placeNode(n, "srcoutput:" + std::to_string(id), kColSrcOutput, ySrcOutput);
                 source_output_nodes[id] = n;
-                y += 150;
 
                 uint32_t target_source = so.value("source", static_cast<uint32_t>(-1));
                 if (target_source != static_cast<uint32_t>(-1) && source_nodes.count(target_source))
@@ -1969,6 +2020,10 @@ struct Example:
     ImTextureID          m_HeaderBackground = nullptr;
     const float          m_TouchTime = 1.0f;
     std::map<ed::NodeId, float, NodeIdLess> m_NodeTouchTime;
+    // Persists node canvas positions across refreshes, keyed by "type:pa_id".
+    // Since m_Nodes is fully rebuilt each refresh (node IDs change), we snapshot
+    // positions here before clearing and restore them after respawning.
+    std::map<std::string, ImVec2> m_SavedPositions;
 };
 
 int Main(int argc, char** argv)
